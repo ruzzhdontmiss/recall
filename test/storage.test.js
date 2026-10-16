@@ -177,20 +177,29 @@ test("a second connection's writes are visible after reload", (t) => {
   );
 });
 
-test("auth migrations are applied once and are idempotent", (t) => {
+test("migrations are applied once, in order, and are idempotent", (t) => {
   const { store, file } = freshStore(t);
   const versions = store.db
     .prepare("SELECT version FROM schema_migrations ORDER BY version")
     .all()
     .map((r) => r.version);
-  assert.deepEqual(versions, ["001_init.sql", "002_auth.sql"]);
+  assert.deepEqual(versions, ["001_init.sql", "002_auth.sql", "003_documents.sql"]);
 
   const tables = store.db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
     .all()
     .map((r) => r.name);
-  for (const table of ["documents", "memories", "containers", "api_keys"]) {
+  for (const table of ["documents", "memories", "containers", "api_keys", "chunks"]) {
     assert.ok(tables.includes(table), `${table} must exist`);
+  }
+
+  // 003 is additive: upload metadata columns exist on documents.
+  const docCols = store.db
+    .prepare("PRAGMA table_info(documents)")
+    .all()
+    .map((r) => r.name);
+  for (const col of ["content_hash", "storage_key", "chunk_count", "previous_document_id"]) {
+    assert.ok(docCols.includes(col), `documents.${col} must exist`);
   }
 
   // Re-opening must not re-run migrations (idempotent) or throw on existing tables.
@@ -224,6 +233,74 @@ test("claimContainer returns false (never throws) when another tenant wins the i
   const claimed = store.claimContainer("race_tag", "my_tenant");
   assert.equal(claimed, false, "a lost race must return false, not throw");
   assert.equal(realGet("race_tag").tenantId, "other_tenant", "ownership must never be overwritten");
+});
+
+test("003 upgrades a pre-existing Phase-3 database without touching old rows", (t) => {
+  const dir = mkTmp();
+  const file = path.join(dir, "legacy.db");
+  t.after(() => rm(dir));
+
+  // Build a database as it existed before Phase 4: only 001 + 002 applied.
+  const Database = require("better-sqlite3");
+  const migDir = path.join(__dirname, "..", "lib", "storage", "migrations");
+  const raw = new Database(file);
+  raw.exec(fs.readFileSync(path.join(migDir, "001_init.sql"), "utf-8"));
+  raw.exec(fs.readFileSync(path.join(migDir, "002_auth.sql"), "utf-8"));
+  raw.exec(
+    "CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
+  );
+  const mark = raw.prepare(
+    "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)"
+  );
+  mark.run("001_init.sql", "2024-01-01T00:00:00.000Z");
+  mark.run("002_auth.sql", "2024-01-01T00:00:00.000Z");
+  // Legacy rows use only the pre-Phase-4 columns.
+  raw
+    .prepare("INSERT INTO documents (id, container_tag, content, created_at) VALUES (?, ?, ?, ?)")
+    .run("legacy1", "u1", "old text", "2024-01-01T00:00:00.000Z");
+  raw
+    .prepare(
+      "INSERT INTO memories (id, document_id, container_tag, text, type, slot, slot_value, status, created_at, expires_at, supersedes, extracted_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    .run(
+      "legacymem",
+      "legacy1",
+      "u1",
+      "old fact",
+      "static",
+      "greeting",
+      "old",
+      "active",
+      "2024-01-01T00:00:00.000Z",
+      null,
+      null,
+      "regex"
+    );
+  raw.close();
+
+  // Opening through the store applies 003 additively.
+  const store = sqlite.create({ file });
+  t.after(() => {
+    try {
+      store.close();
+    } catch {
+      /* ignore */
+    }
+  });
+
+  const doc = store.getDocument("legacy1", "u1");
+  assert.ok(doc, "a legacy document must still load");
+  assert.equal(doc.content, "old text");
+  assert.ok(!("source" in doc), "legacy documents keep their Phase-3 shape");
+  assert.equal(store.listMemories("u1").length, 1, "legacy memories are untouched");
+  assert.equal(store.listChunks("u1").length, 0, "no chunks exist for legacy rows");
+  assert.equal(store.findDocumentByHash("u1", null), null);
+
+  const versions = store.db
+    .prepare("SELECT version FROM schema_migrations ORDER BY version")
+    .all()
+    .map((r) => r.version);
+  assert.deepEqual(versions, ["001_init.sql", "002_auth.sql", "003_documents.sql"]);
 });
 
 test("supersedeSlot writes through so supersession survives reopen", (t) => {

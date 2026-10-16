@@ -15,11 +15,14 @@ const {
 } = require("./lib/validate");
 const {
   embedIngestTexts,
-  searchDocuments,
   searchMemories,
   searchHybrid,
   searchProfile,
+  searchDocumentsWithChunks,
 } = require("./lib/search");
+const { ingestUpload } = require("./lib/documents/ingest");
+const fileStore = require("./lib/documents/storage");
+const { readConfig: readDocConfig } = require("./lib/documents/config");
 
 const PORT = process.env.PORT || 6767;
 
@@ -124,6 +127,14 @@ function createApp(config = readConfig()) {
   const expensiveIfQuery = (req, res, next) =>
     req.query && req.query.q ? expensiveLimiter(req, res, next) : next();
 
+  const docConfig = readDocConfig();
+  // Raw-body uploads only: the global JSON parser ignores these content types,
+  // so this route reads the file bytes itself under a strict size limit.
+  const rawUpload = express.raw({ type: () => true, limit: docConfig.maxUploadBytes });
+
+  // Remove any temp files left behind by a crash mid-upload.
+  fileStore.sweepTemps();
+
   app.use("/v1", ipLimiter, auth, generalLimiter);
 
   // Resolve and authorize the request's container against the authenticated
@@ -198,6 +209,53 @@ function createApp(config = readConfig()) {
     })
   );
 
+  // ---------------------------------------------------- documents:upload --
+  // POST /v1/documents/upload
+  // Raw file body. Media type comes from Content-Type; the original name comes
+  // from `X-Recall-Filename` (or `?filename=`) and is stored as metadata only —
+  // it is never used to build a filesystem path.
+  app.post(
+    "/v1/documents/upload",
+    expensiveLimiter,
+    rawUpload,
+    asyncRoute(async (req, res) => {
+      const tag = resolveTag(req, res, { claim: true });
+      if (!tag) return;
+
+      const filename = req.get("x-recall-filename") || req.query.filename || null;
+      const declaredMime = req.get("content-type") || null;
+      const extractFacts = String(req.query.extractFacts || "").toLowerCase() === "true";
+      // A body this route can't interpret as raw bytes (e.g. a JSON content
+      // type already consumed upstream) is treated as empty and rejected.
+      const buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+
+      try {
+        const result = await ingestUpload({
+          db,
+          containerTag: tag,
+          filename,
+          declaredMime,
+          buffer,
+          extractFacts,
+        });
+        return res.status(result.duplicate ? 200 : 201).json({
+          duplicate: result.duplicate,
+          document: db.publicDocument(result.document),
+          chunkCount: result.chunks.length,
+          memoriesExtracted: result.derivedMemories.length,
+        });
+      } catch (err) {
+        const status = err.status && err.status >= 400 && err.status < 600 ? err.status : 500;
+        const body = { error: status >= 500 ? "internal error" : err.message };
+        if (err.document && err.document.id) {
+          body.documentId = err.document.id;
+          body.status = "failed";
+        }
+        return res.status(status).json(body);
+      }
+    })
+  );
+
   // ------------------------------------------------------------ search ----
   // GET /v1/search?q=...&containerTag=...&searchMode=hybrid|memories|documents
   app.get(
@@ -221,12 +279,19 @@ function createApp(config = readConfig()) {
       const mems = db.listMemories(tag).filter((m) => effectiveStatus(m, now) === "active");
 
       let results = [];
-      if (mode === "documents") {
-        results = await searchDocuments(q, docs);
-      } else if (mode === "memories") {
+      if (mode === "memories") {
         results = await searchMemories(q, mems);
       } else {
-        results = await searchHybrid({ q, docs, mems });
+        // Uploaded files are searchable at chunk granularity; raw-text documents
+        // (which have no chunks) keep the original document-level ranking.
+        const chunks = db.listChunks(tag);
+        const docById = new Map(docs.map((d) => [d.id, d]));
+        const plainDocs = docs.filter((d) => !d.chunkCount);
+        if (mode === "documents") {
+          results = await searchDocumentsWithChunks({ q, docs: plainDocs, chunks, docById });
+        } else {
+          results = await searchHybrid({ q, docs: plainDocs, mems, chunks, docById });
+        }
       }
 
       res.json({
@@ -317,6 +382,41 @@ function createApp(config = readConfig()) {
     res.json({ containerTag: tag, documents: docs });
   });
 
+  // GET /v1/documents/:id — metadata + chunk list (source attribution).
+  app.get("/v1/documents/:id", (req, res) => {
+    if (!isValidId(req.params.id)) return res.status(400).json({ error: "invalid id" });
+    const tag = resolveTag(req, res, { claim: false });
+    if (!tag) return;
+    const doc = db.getDocument(req.params.id, tag);
+    if (!doc) return res.status(404).json({ error: "not found" });
+    const chunks = db.listChunksByDocument(doc.id, tag).map((c) => ({
+      id: c.id,
+      chunkIndex: c.chunkIndex,
+      page: c.page,
+      text: c.text,
+    }));
+    res.json({ document: db.publicDocument(doc), chunks });
+  });
+
+  // DELETE /v1/documents/:id — removes the source, its chunks, its stored file
+  // and only the memories derived from it. Ownership is enforced in the data
+  // layer; a missing file is tolerated and a DB error leaves the record intact.
+  app.delete("/v1/documents/:id", (req, res) => {
+    if (!isValidId(req.params.id)) return res.status(400).json({ error: "invalid id" });
+    const tag = resolveTag(req, res, { claim: false });
+    if (!tag) return;
+    const doc = db.deleteDocument(req.params.id, tag);
+    if (!doc) return res.status(404).json({ error: "not found" });
+    if (doc.storageKey) {
+      try {
+        fileStore.remove(doc.storageKey);
+      } catch (err) {
+        console.warn(`[documents] stored file cleanup failed: ${err.message}`);
+      }
+    }
+    res.json({ ok: true });
+  });
+
   // --------------------------------------------------------- containers ---
   // Authenticated, and only ever returns containers owned by the caller.
   app.get("/v1/containers", (req, res) => {
@@ -383,6 +483,11 @@ function attachShutdown(server, { timeoutMs = 10000 } = {}) {
 
     server.close((err) => {
       clearTimeout(force);
+      try {
+        fileStore.sweepTemps();
+      } catch {
+        /* best-effort temp cleanup */
+      }
       try {
         db.close();
       } catch (closeErr) {

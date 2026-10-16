@@ -40,6 +40,8 @@ mechanics end-to-end in readable code so they can be studied, extended, and self
   both memories and the raw source documents.
 - **Persistence** — a transactional SQLite backend (WAL) with explicit schema migrations
   and embeddings stored alongside each row.
+- **Document ingestion** — upload `.txt`/`.md`/`.pdf`; files are validated, stored privately,
+  chunked (PDF page-aware) and made searchable with provenance back to the source passage.
 - **Tenant-scoped API access** — hashed, scoped API keys with container ownership enforced
   in the data layer.
 
@@ -54,8 +56,9 @@ lib/db.js                 compatibility shim → lib/storage
 lib/storage/index.js      backend selection + facade (STORAGE_BACKEND)
 lib/storage/sqlite.js     SQLite backend (better-sqlite3, WAL, transactions, indexes)
 lib/storage/json.js       legacy JSON backend (kept for rollback)
-lib/storage/migrations/   explicit SQL schema migrations (001 storage, 002 auth)
+lib/storage/migrations/   explicit SQL schema migrations (001 storage, 002 auth, 003 documents)
 lib/storage/vectors.js    embedding encode/decode + validation
+lib/documents/            upload pipeline: storage, extract (txt/md/pdf), chunk, ingest
 lib/extract.js            orchestrates LLM vs regex; applies slot/TTL mechanics
 lib/extract/              openai / anthropic / gemini structured extractors + regex
 lib/embeddings/           xenova (default) / openai / gemini / tfidf
@@ -80,6 +83,29 @@ test/                     node:test regression suite
    (or TF-IDF when no dense provider is available); `GET /v1/profile` returns static
    (durable) and dynamic (temporary) facts.
 
+## How a document flows through Recall
+
+`POST /v1/documents/upload` ingests a file (`.txt`, `.md`, `.pdf`) and makes its text
+searchable at passage granularity:
+
+1. **Validate** — filename, extension, declared content type and magic bytes must agree; size,
+   page count, extracted length and chunk count are all bounded. Anything else is rejected.
+2. **Deduplicate** — the SHA-256 of the bytes identifies an identical, already-processed upload
+   in the same container; it returns the existing document and creates no new chunks.
+3. **Extract** — text is pulled per page for PDFs (via `unpdf`) and normalized; parsing has a
+   wall-clock timeout and a page cap.
+4. **Chunk** — text is split into overlapping passages (paragraph/sentence-aware) with character
+   offsets and, for PDFs, the page number.
+5. **Embed** — chunks are embedded in batches when a dense provider is configured; embedding is
+   best-effort and a failure leaves the chunk lexically searchable rather than lost.
+6. **Persist** — the document row and its chunks are written in one transaction after the file
+   is committed to private storage; any failure removes the file and records a `failed` row.
+7. **Retrieve** — chunks appear in `/v1/search` results with `source: "chunk"`, `documentId`,
+   `filename` and `page`, so every hit is traceable to its source document and passage.
+
+Fact extraction from an upload is **off by default**. Add `?extractFacts=true` to derive
+memories, which are then attributed to the source document (`documentId`) and removed with it.
+
 ## Quick start
 
 ```bash
@@ -96,8 +122,9 @@ npm start
 # open http://localhost:6767 and paste the key into the "api key" field
 ```
 
-Requires **Node.js >= 20** (developed and tested on Node 23.11). Data is stored in SQLite
-by default (`data/recall.db`).
+Requires **Node.js >= 22** (developed and tested on Node 23.11; the PDF extractor `unpdf`
+targets Node 22+). Data is stored in SQLite by default (`data/recall.db`), and uploaded files
+under `data/uploads/`.
 
 On the first request with the default embedding provider, `bge-base-en-v1.5` (~100 MB) is
 downloaded and cached. After that, search is local and key-free.
@@ -123,6 +150,14 @@ default; the variables below are the full surface.
 | `EXTRACTION_PROVIDER` | `auto` | `auto` \| `openai` \| `anthropic` \| `gemini` \| `regex`. |
 | `EXTRACTION_MODEL` | provider default | Override the extraction model id. |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY` | *(empty)* | Provider credentials. |
+| `UPLOAD_DIR` | `DATA_DIR/uploads` | Private directory for uploaded files (dirs `0700`, files `0600`). |
+| `MAX_UPLOAD_BYTES` | `10485760` (10 MiB) | Hard cap on a single uploaded file. |
+| `MAX_PDF_PAGES` | `500` | Reject PDFs with more pages. |
+| `PDF_EXTRACT_TIMEOUT_MS` | `20000` | Wall-clock bound on PDF parsing. |
+| `MAX_EXTRACTED_CHARS` | `2000000` | Reject documents that extract more text than this. |
+| `CHUNK_SIZE` / `CHUNK_OVERLAP` | `1200` / `200` | Chunking window and overlap (characters). |
+| `MAX_CHUNKS` | `2000` | Reject documents that produce more chunks. |
+| `EMBED_BATCH_SIZE` | `64` | Chunks embedded per batch. |
 
 ### API-key bootstrap
 
@@ -226,6 +261,30 @@ curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/memories?containerTag=us
 # Forget a memory
 curl -X DELETE -H "Authorization: Bearer $KEY" "localhost:6767/v1/memories/<id>?containerTag=user_123"
 
+# Upload a document (.txt | .md | .pdf). Raw body; the original name is metadata only.
+curl -X POST localhost:6767/v1/documents/upload \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: text/markdown" \
+  -H "X-Recall-Filename: notes.md" \
+  --data-binary @notes.md
+# -> 201 { duplicate:false, document:{ id, source:"upload", filename, mediaType, pageCount, status:"ready", ... }, chunkCount, memoriesExtracted:0 }
+
+# Optional: also extract memories from the upload (attributed to the document)
+curl -X POST "localhost:6767/v1/documents/upload?extractFacts=true&containerTag=user_123" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/pdf" \
+  -H "X-Recall-Filename: resume.pdf" --data-binary @resume.pdf
+
+# Document metadata + its searchable chunks
+curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/documents/<id>?containerTag=user_123"
+
+# Uploaded content is searchable; chunk hits carry provenance
+curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/search?q=rockets&containerTag=user_123&searchMode=documents"
+# -> results: [{ source:"chunk", documentId:"…", chunkIndex:3, page:2, filename:"report.pdf", score, text }, …]
+
+# Delete a source: removes the document, its chunks, its stored file and only
+# the memories derived from it
+curl -X DELETE -H "Authorization: Bearer $KEY" "localhost:6767/v1/documents/<id>?containerTag=user_123"
+
 # Your containers, and a self-description of the calling key
 curl -H "Authorization: Bearer $KEY" localhost:6767/v1/containers
 curl -H "Authorization: Bearer $KEY" localhost:6767/v1/whoami
@@ -233,8 +292,27 @@ curl -H "Authorization: Bearer $KEY" localhost:6767/v1/whoami
 
 Status codes: `400` validation error, `401` missing/invalid/revoked/expired key, `403`
 container not owned by your tenant, `404` unknown id within an owned container, `413` payload
-too large, `429` rate limited. Error bodies are generic (`{"error":"..."}`) and never leak
-secrets or internals.
+too large (or a document over the size/page/chunk limits), `415` unsupported type / content
+type-magic-byte mismatch, `422` unreadable or malformed document, `429` rate limited. Error
+bodies are generic (`{"error":"..."}`) and never leak secrets, absolute paths or internals.
+
+### Document ingestion
+
+- **Supported now:** `.txt`, `.md`, `.pdf` (text extraction; no OCR). Word/audio/code and
+  scanned/image-only PDFs are out of scope for this phase.
+- **Synchronous pipeline.** Uploads are processed in the request; there is no queue. Small and
+  medium files are fine, but a very large PDF holds the request open (bounded by
+  `PDF_EXTRACT_TIMEOUT_MS`).
+- **Private storage.** Files are written under `UPLOAD_DIR` with server-generated names
+  (`<uuid>.<ext>`) and `0600` permissions. The client's filename is stored as metadata only and
+  is never used to build a path — path traversal is not possible.
+- **Version lineage, not supersession.** Uploading a new file with the same name and different
+  bytes creates a *new* document whose `previousDocumentId` points at the prior version; both
+  are retained and searchable until you delete one.
+- **Failed uploads** are recorded with `status:"failed"` and an `errorCode` (e.g.
+  `pdf_unreadable`), create no chunks, leave no file, and never block a later retry.
+- **Retrieval without embeddings.** When the embedding provider is lexical, or chunk embedding
+  fails, chunk ranking falls back to TF-IDF so uploaded content stays searchable.
 
 ### Try contradiction resolution
 
@@ -264,6 +342,13 @@ thin compatibility shim.
 | `json` | `data/store.json` | Legacy backend, kept for rollback. |
 
 Environment: `DATA_DIR` (default `./data`), `SQLITE_FILE`, `STORE_FILE` override the paths.
+
+Migration `003_documents.sql` is **additive**: it adds nullable upload-metadata columns to
+`documents` (filename, media type, size, content hash, status, page count, chunk count, version
+lineage, …) and a new `chunks` table. Existing rows are untouched. Uploaded files are stored as
+regular files under `UPLOAD_DIR`, while their text, metadata and embeddings live in the
+database. Both backends implement the same document-metadata and chunk operations, so
+`STORAGE_BACKEND=json` remains a complete rollback path.
 
 Embeddings are stored as `Float64` BLOBs with provider/model/dimension metadata. Vectors are
 validated on write and never truncated or reinterpreted. If the SQLite database is empty while
@@ -295,8 +380,11 @@ printed.
 
 ### Backup and rollback
 
-- **Backup:** with the app stopped, copy `data/recall.db` (and any `-wal`/`-shm` sidecars), or
-  use `sqlite3 data/recall.db ".backup data/recall-backup.db"`. The migration command also
+- **Backup:** with the app stopped, copy `data/recall.db` (and any `-wal`/`-shm` sidecars) **and
+  the `data/uploads/` directory** — the database stores documents, chunks and embeddings, but
+  the original uploaded files live on disk. Losing `uploads/` does not break search (chunk text
+  and vectors are in the database) but breaks exact byte-level retention. You can also use
+  `sqlite3 data/recall.db ".backup data/recall-backup.db"`. The migration command additionally
   stores a timestamped copy of the source JSON under `data/backups/`.
 - **Rollback to JSON:** set `STORAGE_BACKEND=json` and restart. The original `data/store.json`
   is left intact by the migration, so this restores the previous behaviour exactly.
@@ -350,14 +438,23 @@ EXTRACTION_PROVIDER=anthropic ANTHROPIC_API_KEY=... npm start
 ## Testing and evaluations
 
 ```bash
-npm test                      # storage, migration, API, auth/isolation and shutdown tests
+npm test                      # storage, migration, API, auth/isolation, document ingestion, shutdown
 npm run eval:search           # paraphrase retrieval check (downloads the local model on first run)
 npm run eval:extract          # regex-gap + structured-schema check (live LLM skipped without a key)
+npm run eval:documents        # end-to-end txt/md/pdf ingestion, attribution, dedupe, scoping, delete
 ```
 
 Tests use Node's built-in runner with temporary directories and never touch the real store.
 They run with `EMBEDDINGS_PROVIDER=tfidf` and `EXTRACTION_PROVIDER=regex` for speed and
 determinism; live model/LLM paths are exercised separately by the eval scripts.
+
+The document suite (`test/documents.test.js`, `test/rank-chunks.test.js`) covers happy-path
+txt/md/pdf ingestion with page/chunk attribution, every rejection path (empty, unsupported,
+mismatched MIME, fake magic bytes, binary-as-text, oversize, traversal filename), the chunk and
+page ceilings, dedupe, version lineage, cross-tenant read/list/search/delete isolation,
+deletion of a source (document + chunks + file + only its derived memories) and persistence
+across a database reopen. `test/rank-chunks.test.js` proves chunk retrieval falls back to
+lexical scoring when embeddings are absent or generation fails.
 
 The auth suite (`test/auth.test.js`) covers missing/malformed/invalid/revoked/expired keys,
 cross-tenant reads/searches/profile/enumeration/deletes for **every** data route, IDOR via
@@ -378,6 +475,11 @@ Recall is a single-node, self-hosted engine. Known limits, stated honestly:
 - **Rate limiting is in-memory and per-process**, not distributed.
 - **Brute-force vector scoring.** Search ranks vectors in memory rather than using an indexed
   vector store; fine for this scale, not for millions of rows.
+- **Document ingestion is synchronous and local-disk based.** Uploads are processed inline (no
+  queue), so a very large PDF holds the request open until `PDF_EXTRACT_TIMEOUT_MS`. Files are
+  kept on the server's local disk under `UPLOAD_DIR` (not object storage) and must be backed up
+  together with the database. Text extraction only: scanned/image-only PDFs and non-text formats
+  (Word, audio, code) are not supported, and there is no OCR.
 - **Local/offline trust model.** Authentication and tenant isolation are enforced, but the app
   is intended to run on a trusted host behind your own network controls. Serve it over TLS and
   keep it off the public internet unless you have deliberately reviewed the deployment.
@@ -405,7 +507,8 @@ Product-oriented next steps, roughly in order:
   advisories and tracks the maintained runtime.
 - **Indexed vector search** — move scoring out of memory (e.g. `sqlite-vec` or an external
   vector store) behind the existing `lib/storage` facade.
-- **File ingestion** — accept documents/uploads and extract memory from them, not just raw text.
+- **File ingestion** — shipped for `.txt` / `.md` / `.pdf` (upload → extract → chunk → embed →
+  search, with attribution). Next: more formats and OCR for scanned PDFs.
 - **Connectors** — pull from Gmail, Drive, Notion, etc. as content sources.
 - **MCP server / SDKs** — expose Recall to agents (Claude Desktop, editors) as a memory tool.
 - **Shared, multi-process deployment** — a distributed rate limiter and a stateless read path
@@ -413,7 +516,7 @@ Product-oriented next steps, roughly in order:
 
 ## Status
 
-Functional and tested for the described scope: ingestion, extraction, persistence, retrieval,
-authentication and tenant isolation. It is a focused engineering project, **not** a
-production-hardened, horizontally-scaled service — see [Limitations](#limitations) before
-exposing it.
+Functional and tested for the described scope: ingestion (raw text and `.txt`/`.md`/`.pdf`
+uploads), extraction, persistence, retrieval, authentication and tenant isolation. It is a
+focused engineering project, **not** a production-hardened, horizontally-scaled service — see
+[Limitations](#limitations) before exposing it.
