@@ -16,7 +16,7 @@ Notion...), file/OCR/video pipelines, an MCP server, and SDKs. This clone reprod
 |---|---|
 | LLM extracts facts from conversations | Structured LLM output when an API key is set; regex fallback otherwise |
 | Embedding model (bge-base or provider API) | Local `Xenova/bge-base-en-v1.5` via Transformers.js; optional OpenAI/Gemini |
-| Postgres / vector DB | One JSON file in `data/store.json` (vectors stored on each row) |
+| Postgres / vector DB | One SQLite file in `data/recall.db` (WAL; vectors stored on each row) |
 | Contradiction resolution via LLM | "Slot" matching — a new fact in the same slot (location, employer, editor, ...) for a user supersedes the old one |
 | Automatic forgetting | Dynamic memories get a TTL based on temporal keywords (`tomorrow`, `this week`, `currently`, ...) and expire on read |
 
@@ -31,8 +31,76 @@ npm start
 # open http://localhost:6767
 ```
 
+Requires **Node.js >= 20** (developed and tested on Node 23.11). Data is stored in SQLite by
+default (`data/recall.db`).
+
 The first request with the default provider downloads and caches `bge-base-en-v1.5`
 (~100MB). After that, search is local and key-free.
+
+## Storage
+
+Recall keeps its data in SQLite (WAL mode) via [`better-sqlite3`](https://github.com/WiseLibs/better-sqlite3),
+which shares a prebuilt native binary for common platforms (no compiler required). The REST
+contract is unchanged — the storage backend sits behind `lib/storage/` and `lib/db.js` is a
+thin compatibility shim.
+
+| `STORAGE_BACKEND` | File | Notes |
+|---|---|---|
+| `sqlite` (default) | `data/recall.db` | Durable, transactional, single-file. |
+| `json` | `data/store.json` | Legacy backend, kept for rollback. |
+
+Environment: `DATA_DIR` (default `./data`), `SQLITE_FILE`, `STORE_FILE` override the paths.
+
+Embeddings are stored as `Float64` BLOBs with provider/model/dimension metadata. Vectors are
+validated on write and never truncated or reinterpreted. If the SQLite database is empty while
+a legacy JSON store still holds data, the server logs a warning and **does not migrate
+automatically**.
+
+### Migrating from the JSON store
+
+The migration is one-way and safe: it **never deletes or overwrites** `data/store.json`, backs
+it up first, validates every record, writes in a single transaction and is idempotent on reruns.
+
+```bash
+# 1. Stop the app so it is not holding the database.
+# 2. Preview what would happen (writes nothing):
+npm run db:migrate-json -- --dry-run
+
+# 3. Migrate (writes data/recall.db and backs up the source under data/backups/):
+npm run db:migrate-json
+
+# 4. Start as usual — SQLite is the default backend:
+npm start
+```
+
+The command reports source/target document and memory counts, per-status counts, vector
+dimensions and a final verification that every source id is present. Corrupt JSON, duplicate
+ids, orphan memories (`documentId` with no parent) and malformed embeddings are reported by id
+and block the migration (add `--allow-partial` to skip invalid rows). Memory content is never
+printed.
+
+### Backup and rollback
+
+- **Backup:** with the app stopped, copy `data/recall.db` (and any `-wal`/`-shm` sidecars), or
+  use `sqlite3 data/recall.db ".backup data/recall-backup.db"`. The migration command also
+  stores a timestamped copy of the source JSON under `data/backups/`.
+- **Rollback to JSON:** set `STORAGE_BACKEND=json` and restart. The original `data/store.json`
+  is left intact by the migration, so this restores the previous behaviour exactly.
+- The JSON store is never removed automatically; delete it yourself only after you are
+  satisfied the SQLite data is correct.
+
+## Testing
+
+```bash
+npm test                      # storage, migration, API and shutdown regression tests
+npm run eval:search           # paraphrase retrieval check (downloads the local model on first run)
+npm run eval:extract          # regex-gap + structured-schema check (live LLM skipped without a key)
+```
+
+Tests use Node's built-in runner with temporary directories and never touch the real store.
+They run with `EMBEDDINGS_PROVIDER=tfidf` and `EXTRACTION_PROVIDER=regex` for speed and
+determinism; live model/LLM paths are exercised separately by the eval scripts.
+
 
 ## Embeddings
 
@@ -128,20 +196,29 @@ curl "localhost:6767/v1/profile?containerTag=user_123"
 ## Project layout
 
 ```
-server.js                 Express app, all routes
-lib/db.js                 zero-config JSON-file storage
+server.js                 Express app, all routes (+ graceful shutdown)
+lib/db.js                 compatibility shim -> lib/storage
+lib/storage/index.js      backend selection + facade (STORAGE_BACKEND)
+lib/storage/sqlite.js     SQLite backend (better-sqlite3, WAL, transactions)
+lib/storage/json.js       legacy JSON backend (rollback)
+lib/storage/migrations/   explicit SQL schema migrations
+lib/storage/vectors.js    embedding encode/decode + validation
 lib/extract.js            orchestrates LLM vs regex; persist slot/TTL mechanics
 lib/extract/              openai / anthropic / gemini structured extractors + regex
 lib/tfidf.js              TF-IDF fallback scorer
 lib/embeddings/           xenova (default) / openai / gemini / tfidf
 lib/search.js             hybrid ranking over stored vectors
 public/                   vanilla HTML/CSS/JS web UI
-data/store.json           created on first run — all your data lives here
+data/recall.db            SQLite store (default backend) — created on first run
+data/store.json           legacy JSON store (only with STORAGE_BACKEND=json)
+scripts/db-migrate-json.js JSON -> SQLite migration CLI
 scripts/eval-search.js    paraphrase retrieval check
 scripts/eval-extract.js   regex-gap + LLM extraction check
+test/                     node:test regression suite
 ```
 
 ## Extending it
 
-- **Persistence**: swap `lib/db.js` for SQLite/Postgres once the JSON file gets unwieldy,
-  and index the existing `embedding` arrays instead of scoring them in memory.
+- **Persistence**: set `STORAGE_BACKEND=json` to roll back, or extend `lib/storage/` (e.g. a
+  Postgres adapter behind the same facade) and index the `embedding` BLOBs instead of scoring
+  them in memory.

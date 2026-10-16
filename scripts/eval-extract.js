@@ -65,16 +65,34 @@ async function main() {
 
   db.reset();
   const now = new Date();
+  // Memories reference their source document (enforced by the SQLite backend),
+  // so create the parent documents first.
+  const regexDocId = crypto.randomUUID();
+  db.addDocument({
+    id: regexDocId,
+    containerTag: "eval_retract",
+    content: retract.content,
+    createdAt: now.toISOString(),
+    embedding: null,
+  });
   persistFacts({
-    documentId: crypto.randomUUID(),
+    documentId: regexDocId,
     containerTag: "eval_retract",
     facts: retractRegex,
     db,
     now,
     extractedBy: "regex",
   });
+  const llmDocId = crypto.randomUUID();
+  db.addDocument({
+    id: llmDocId,
+    containerTag: "eval_retract",
+    content: "I moved to Lisbon.",
+    createdAt: new Date(now.getTime() + 1000).toISOString(),
+    embedding: null,
+  });
   persistFacts({
-    documentId: crypto.randomUUID(),
+    documentId: llmDocId,
     containerTag: "eval_retract",
     facts: [
       {

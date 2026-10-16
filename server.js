@@ -2,15 +2,17 @@ const express = require("express");
 const crypto = require("crypto");
 const path = require("path");
 const db = require("./lib/db");
-const { extractMemories, effectiveStatus, resolveExtractionProvider } = require("./lib/extract");
+const { classifyContent, persistFacts, effectiveStatus } = require("./lib/extract");
 const embeddings = require("./lib/embeddings");
-const { attachOnIngest, searchDocuments, searchMemories, searchHybrid, searchProfile } = require("./lib/search");
+const {
+  embedIngestTexts,
+  searchDocuments,
+  searchMemories,
+  searchHybrid,
+  searchProfile,
+} = require("./lib/search");
 
-const app = express();
 const PORT = process.env.PORT || 6767;
-
-app.use(express.json({ limit: "2mb" }));
-app.use(express.static(path.join(__dirname, "public")));
 
 const DEFAULT_TAG = "demo_user";
 
@@ -20,156 +22,241 @@ function asyncRoute(fn) {
   };
 }
 
-// ---------------------------------------------------------------- add -----
-// POST /v1/add  { content, containerTag? }
-app.post(
-  "/v1/add",
-  asyncRoute(async (req, res) => {
-    const { content, containerTag } = req.body || {};
-    if (!content || typeof content !== "string" || !content.trim()) {
-      return res.status(400).json({ error: "content is required" });
-    }
-    const tag = containerTag || DEFAULT_TAG;
-    const now = new Date();
+function createApp() {
+  const app = express();
 
-    const doc = db.addDocument({
-      id: crypto.randomUUID(),
-      containerTag: tag,
-      content: content.trim(),
-      createdAt: now.toISOString(),
-    });
+  app.use(express.json({ limit: "2mb" }));
+  app.use(express.static(path.join(__dirname, "public")));
 
-    const memories = await extractMemories({
-      documentId: doc.id,
-      containerTag: tag,
-      content: doc.content,
-      db,
-      now,
-    });
+  // -------------------------------------------------------------- add -----
+  // POST /v1/add  { content, containerTag? }
+  app.post(
+    "/v1/add",
+    asyncRoute(async (req, res) => {
+      const { content, containerTag } = req.body || {};
+      if (!content || typeof content !== "string" || !content.trim()) {
+        return res.status(400).json({ error: "content is required" });
+      }
+      const tag = containerTag || DEFAULT_TAG;
+      const now = new Date();
 
-    await attachOnIngest({ document: doc, memories });
+      const draft = {
+        id: crypto.randomUUID(),
+        containerTag: tag,
+        content: content.trim(),
+        createdAt: now.toISOString(),
+        embedding: null,
+      };
 
-    res.json({
-      document: db.publicDocument(doc),
-      memoriesExtracted: memories.filter((m) => m.type !== "note").length,
-      memories: memories.map(db.publicMemory),
-      extractionProvider: (memories[0] && memories[0].extractedBy) || resolveExtractionProvider(),
-    });
-  })
-);
+      // Extract first (async, may call an LLM), then persist the document,
+      // its memories and their embeddings in a single transaction.
+      const { facts, provider } = await classifyContent(draft.content);
+      const vectors = await embedIngestTexts([draft.content, ...facts.map((f) => f.text)]);
 
-// -------------------------------------------------------------- search ----
-// GET /v1/search?q=...&containerTag=...&searchMode=hybrid|memories|documents
-app.get(
-  "/v1/search",
-  asyncRoute(async (req, res) => {
-    const { q } = req.query;
+      const { doc, memories } = db.transaction(() => {
+        const savedDoc = db.addDocument({
+          ...draft,
+          embedding: vectors ? vectors[0] || null : null,
+        });
+        const savedMemories = persistFacts({
+          documentId: savedDoc.id,
+          containerTag: tag,
+          facts,
+          db,
+          now,
+          extractedBy: provider,
+          embeddings: vectors ? vectors.slice(1) : null,
+        });
+        return { doc: savedDoc, memories: savedMemories };
+      });
+
+      res.json({
+        document: db.publicDocument(doc),
+        memoriesExtracted: memories.filter((m) => m.type !== "note").length,
+        memories: memories.map(db.publicMemory),
+        extractionProvider: (memories[0] && memories[0].extractedBy) || provider,
+      });
+    })
+  );
+
+  // ------------------------------------------------------------ search ----
+  // GET /v1/search?q=...&containerTag=...&searchMode=hybrid|memories|documents
+  app.get(
+    "/v1/search",
+    asyncRoute(async (req, res) => {
+      const { q } = req.query;
+      const tag = req.query.containerTag || DEFAULT_TAG;
+      const mode = req.query.searchMode || "hybrid";
+      if (!q) return res.status(400).json({ error: "q is required" });
+
+      const now = new Date();
+      let results = [];
+
+      const docs = db.documents.filter((d) => d.containerTag === tag);
+      const mems = db.memories.filter(
+        (m) => m.containerTag === tag && effectiveStatus(m, now) === "active"
+      );
+
+      if (mode === "documents") {
+        results = await searchDocuments(q, docs);
+      } else if (mode === "memories") {
+        results = await searchMemories(q, mems);
+      } else {
+        results = await searchHybrid({ q, docs, mems });
+      }
+
+      res.json({
+        results: results.slice(0, 20),
+        searchMode: mode,
+        containerTag: tag,
+        embeddingsProvider: embeddings.getProviderName(),
+      });
+    })
+  );
+
+  // ----------------------------------------------------------- profile ----
+  // GET /v1/profile?containerTag=...&q=optional
+  app.get(
+    "/v1/profile",
+    asyncRoute(async (req, res) => {
+      const tag = req.query.containerTag || DEFAULT_TAG;
+      const now = new Date();
+
+      const mems = db.memories.filter((m) => m.containerTag === tag);
+      const staticFacts = mems.filter(
+        (m) => m.type === "static" && effectiveStatus(m, now) === "active"
+      );
+      const dynamicFacts = mems.filter(
+        (m) => m.type === "dynamic" && effectiveStatus(m, now) === "active"
+      );
+
+      const profile = {
+        static: staticFacts
+          .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+          .map((m) => ({ id: m.id, text: m.text, slot: m.slot })),
+        dynamic: dynamicFacts
+          .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+          .map((m) => ({ id: m.id, text: m.text, expiresAt: m.expiresAt })),
+      };
+
+      let searchResults = undefined;
+      if (req.query.q) {
+        const active = mems.filter((m) => effectiveStatus(m, now) === "active");
+        searchResults = await searchProfile(req.query.q, active);
+      }
+
+      res.json({ containerTag: tag, profile, searchResults });
+    })
+  );
+
+  // ----------------------------------------------------------- memories ---
+  // GET /v1/memories?containerTag=...  (includes superseded/expired, for transparency)
+  app.get("/v1/memories", (req, res) => {
     const tag = req.query.containerTag || DEFAULT_TAG;
-    const mode = req.query.searchMode || "hybrid";
-    if (!q) return res.status(400).json({ error: "q is required" });
-
     const now = new Date();
-    let results = [];
+    const mems = db.memories
+      .filter((m) => m.containerTag === tag)
+      .map((m) => ({ ...db.publicMemory(m), effectiveStatus: effectiveStatus(m, now) }))
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    res.json({ containerTag: tag, memories: mems });
+  });
 
-    const docs = db.documents.filter((d) => d.containerTag === tag);
-    const mems = db.memories.filter(
-      (m) => m.containerTag === tag && effectiveStatus(m, now) === "active"
-    );
-
-    if (mode === "documents") {
-      results = await searchDocuments(q, docs);
-    } else if (mode === "memories") {
-      results = await searchMemories(q, mems);
-    } else {
-      results = await searchHybrid({ q, docs, mems });
-    }
-
-    res.json({
-      results: results.slice(0, 20),
-      searchMode: mode,
-      containerTag: tag,
-      embeddingsProvider: embeddings.getProviderName(),
-    });
-  })
-);
-
-// ------------------------------------------------------------- profile ----
-// GET /v1/profile?containerTag=...&q=optional
-app.get(
-  "/v1/profile",
-  asyncRoute(async (req, res) => {
+  // DELETE /v1/memories/:id?containerTag=...  -- "forget"
+  // Ownership is enforced at the data-access boundary: a memory can only be
+  // forgotten when its containerTag matches the request scope.
+  app.delete("/v1/memories/:id", (req, res) => {
     const tag = req.query.containerTag || DEFAULT_TAG;
-    const now = new Date();
+    const mem = db.forgetMemory(req.params.id, tag);
+    if (!mem) return res.status(404).json({ error: "not found" });
+    res.json({ ok: true });
+  });
 
-    const mems = db.memories.filter((m) => m.containerTag === tag);
-    const staticFacts = mems.filter(
-      (m) => m.type === "static" && effectiveStatus(m, now) === "active"
-    );
-    const dynamicFacts = mems.filter(
-      (m) => m.type === "dynamic" && effectiveStatus(m, now) === "active"
-    );
+  // ---------------------------------------------------------- documents ---
+  app.get("/v1/documents", (req, res) => {
+    const tag = req.query.containerTag || DEFAULT_TAG;
+    const docs = db.documents
+      .filter((d) => d.containerTag === tag)
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .map(db.publicDocument);
+    res.json({ containerTag: tag, documents: docs });
+  });
 
-    const profile = {
-      static: staticFacts
-        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-        .map((m) => ({ id: m.id, text: m.text, slot: m.slot })),
-      dynamic: dynamicFacts
-        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-        .map((m) => ({ id: m.id, text: m.text, expiresAt: m.expiresAt })),
+  app.get("/v1/containers", (_req, res) => {
+    const tags = new Set(db.documents.map((d) => d.containerTag));
+    res.json({ containerTags: Array.from(tags) });
+  });
+
+  // ------------------------------------------------------------- errors ---
+  // Structured, redacted error handling. Never logs request bodies, headers,
+  // secrets or stack traces; never returns internal detail to the client.
+  app.use((err, req, res, next) => {
+    const raw = err && (err.status || err.statusCode);
+    const status = raw >= 400 && raw < 600 ? raw : 500;
+    const event = {
+      level: status >= 500 ? "error" : "warn",
+      event: "request_failed",
+      method: req.method,
+      path: req.path,
+      status,
+      error: (err && err.name) || "Error",
     };
+    if (err && err.code) event.code = err.code;
+    const write = status >= 500 ? console.error : console.warn;
+    write(JSON.stringify(event));
 
-    let searchResults = undefined;
-    if (req.query.q) {
-      const active = mems.filter((m) => effectiveStatus(m, now) === "active");
-      searchResults = await searchProfile(req.query.q, active);
-    }
+    if (res.headersSent) return next(err);
+    const messages = {
+      400: "invalid request body",
+      413: "payload too large",
+      415: "unsupported media type",
+    };
+    const message = messages[status] || (status >= 500 ? "internal error" : "bad request");
+    res.status(status).json({ error: message });
+  });
 
-    res.json({ containerTag: tag, profile, searchResults });
-  })
-);
+  return app;
+}
 
-// ------------------------------------------------------------- memories ---
-// GET /v1/memories?containerTag=...  (includes superseded/expired, for transparency)
-app.get("/v1/memories", (req, res) => {
-  const tag = req.query.containerTag || DEFAULT_TAG;
-  const now = new Date();
-  const mems = db.memories
-    .filter((m) => m.containerTag === tag)
-    .map((m) => ({ ...db.publicMemory(m), effectiveStatus: effectiveStatus(m, now) }))
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  res.json({ containerTag: tag, memories: mems });
-});
+const app = createApp();
 
-// DELETE /v1/memories/:id  -- "forget"
-app.delete("/v1/memories/:id", (req, res) => {
-  const mem = db.memories.find((m) => m.id === req.params.id);
-  if (!mem) return res.status(404).json({ error: "not found" });
-  mem.status = "forgotten";
-  db.touch();
-  res.json({ ok: true });
-});
+// Graceful shutdown: stop accepting connections, close the database, then exit.
+// Guarded against duplicate execution and a hard timeout so it can never hang.
+function attachShutdown(server, { timeoutMs = 10000 } = {}) {
+  let closing = false;
+  return function shutdown(signal) {
+    if (closing) return;
+    closing = true;
+    console.log(`[server] ${signal} received — shutting down`);
+    const force = setTimeout(() => {
+      console.error("[server] graceful shutdown timed out — forcing exit");
+      process.exit(1);
+    }, timeoutMs);
 
-// ------------------------------------------------------------ documents ---
-app.get("/v1/documents", (req, res) => {
-  const tag = req.query.containerTag || DEFAULT_TAG;
-  const docs = db.documents
-    .filter((d) => d.containerTag === tag)
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-    .map(db.publicDocument);
-  res.json({ containerTag: tag, documents: docs });
-});
+    server.close((err) => {
+      clearTimeout(force);
+      try {
+        db.close();
+      } catch (closeErr) {
+        console.warn(`[storage] close failed: ${closeErr.message}`);
+      }
+      if (err) {
+        console.warn(`[server] close error: ${err.message}`);
+        process.exit(1);
+      }
+      process.exit(0);
+    });
+    if (typeof server.closeIdleConnections === "function") server.closeIdleConnections();
+  };
+}
 
-app.get("/v1/containers", (_req, res) => {
-  const tags = new Set(db.documents.map((d) => d.containerTag));
-  res.json({ containerTags: Array.from(tags) });
-});
+if (require.main === module) {
+  const server = app.listen(PORT, () => {
+    console.log(`supermemory-clone running at http://localhost:${PORT}`);
+    embeddings.warmup();
+  });
+  const shutdown = attachShutdown(server);
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+}
 
-app.use((err, _req, res, _next) => {
-  console.error(err);
-  res.status(500).json({ error: err.message || "internal error" });
-});
-
-app.listen(PORT, () => {
-  console.log(`supermemory-clone running at http://localhost:${PORT}`);
-  embeddings.warmup();
-});
+module.exports = { app, createApp, attachShutdown };
