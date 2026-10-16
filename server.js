@@ -400,7 +400,7 @@ function attachShutdown(server, { timeoutMs = 10000 } = {}) {
 
 if (require.main === module) {
   const server = app.listen(PORT, () => {
-    console.log(`supermemory-clone running at http://localhost:${PORT}`);
+    console.log(`Recall running at http://localhost:${PORT}`);
     embeddings.warmup();
   });
   const shutdown = attachShutdown(server);

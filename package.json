@@ -1,5 +1,5 @@
 {
-  "name": "supermemory-clone",
+  "name": "recall-ai-memory",
   "version": "0.1.0",
   "description": "A self-hosted clone of the core supermemory.ai loop: add content, extract memories, build a user profile, hybrid search. Zero external services required.",
   "main": "server.js",

@@ -1,31 +1,86 @@
-# recall — a supermemory clone
+# Recall — self-hosted AI memory infrastructure
 
-A small, self-contained clone of the core loop in [supermemoryai/supermemory](https://github.com/supermemoryai/supermemory):
-add content → extract durable/temporary facts → build a user profile → hybrid search over memories + raw documents.
+Recall is a small, self-contained memory engine for AI applications: it ingests raw
+text, extracts durable and temporary facts, keeps them consistent over time (supersession
+and expiry), and serves them back through hybrid semantic search and a user profile.
 
-No external services or cloud keys are required for the default path, but the API is
-**authenticated by default**: you bootstrap a local API key once, then `npm start` and it's
-running.
+It is *memory infrastructure*, not a chatbot. A consuming agent or app calls Recall to
+store what it learns and to retrieve relevant context, then uses that context when
+generating a response.
 
-## What's real vs. simplified
+The whole loop runs locally with **no external services or cloud keys required** for the
+default path — local embeddings, a regex extractor fallback, and a single SQLite file.
+Optional provider keys upgrade embeddings and extraction to hosted models.
 
-The actual supermemory is a production system: Cloudflare Workers backend, Postgres +
-vector DB, LLM-based fact extraction, real embedding models, connectors (Gmail, Drive,
-Notion...), file/OCR/video pipelines, an MCP server, and SDKs. This clone reproduces the
-**mechanics** of the core memory loop, with cheap stand-ins for the remaining expensive parts:
+```mermaid
+flowchart LR
+  A[Client / agent] -->|POST /v1/add| B(Extract facts)
+  B --> C{LLM key set?}
+  C -- yes --> D[Structured LLM extraction]
+  C -- no --> E[Regex extraction]
+  D --> F[Supersession + TTL]
+  E --> F
+  F --> G[(SQLite + vectors)]
+  A -->|GET /v1/search| H[Hybrid ranking]
+  A -->|GET /v1/profile| I[Static + dynamic facts]
+  G --> H
+  G --> I
+```
 
-| Real supermemory | This clone |
-|---|---|
-| LLM extracts facts from conversations | Structured LLM output when an API key is set; regex fallback otherwise |
-| Embedding model (bge-base or provider API) | Local `Xenova/bge-base-en-v1.5` via Transformers.js; optional OpenAI/Gemini |
-| Postgres / vector DB | One SQLite file in `data/recall.db` (WAL; vectors stored on each row) |
-| Contradiction resolution via LLM | "Slot" matching — a new fact in the same slot (location, employer, editor, ...) for a user supersedes the old one |
-| Automatic forgetting | Dynamic memories get a TTL based on temporal keywords (`tomorrow`, `this week`, `currently`, ...) and expire on read |
+## Why it exists
 
-The API shapes (`add`, `search` with `searchMode`, `profile` returning `static`/`dynamic`,
-`containerTag` for scoping) intentionally mirror the real API from the README.
+Hosted "memory" APIs make the core mechanics invisible. Recall implements the same
+mechanics end-to-end in readable code so they can be studied, extended, and self-hosted:
 
-## Run it
+- **Structured fact extraction** — an LLM (OpenAI / Anthropic / Gemini) emits typed facts
+  through a JSON schema; a deterministic regex extractor keeps the app working offline.
+- **Memory lifecycle** — slot-based supersession resolves contradictions ("I live in
+  Berlin" → "I now live in Lisbon") and temporal keywords give temporary facts a TTL.
+- **Semantic retrieval** — local `bge-base-en-v1.5` embeddings power hybrid search over
+  both memories and the raw source documents.
+- **Persistence** — a transactional SQLite backend (WAL) with explicit schema migrations
+  and embeddings stored alongside each row.
+- **Tenant-scoped API access** — hashed, scoped API keys with container ownership enforced
+  in the data layer.
+
+## Architecture
+
+```
+server.js                 Express app: routes, auth, tenant isolation, limits, shutdown
+lib/auth.js               API-key issuance/hashing, auth middleware, container authorization
+lib/validate.js           request / identifier / container / payload-size validation
+lib/ratelimit.js          in-memory per-key rate limiter
+lib/db.js                 compatibility shim → lib/storage
+lib/storage/index.js      backend selection + facade (STORAGE_BACKEND)
+lib/storage/sqlite.js     SQLite backend (better-sqlite3, WAL, transactions, indexes)
+lib/storage/json.js       legacy JSON backend (kept for rollback)
+lib/storage/migrations/   explicit SQL schema migrations (001 storage, 002 auth)
+lib/storage/vectors.js    embedding encode/decode + validation
+lib/extract.js            orchestrates LLM vs regex; applies slot/TTL mechanics
+lib/extract/              openai / anthropic / gemini structured extractors + regex
+lib/embeddings/           xenova (default) / openai / gemini / tfidf
+lib/search.js             hybrid ranking over stored vectors
+lib/tfidf.js              TF-IDF fallback scorer
+public/                   vanilla HTML/CSS/JS dashboard (API-key field + authenticated calls)
+scripts/                  key CLI, JSON→SQLite migration, and evaluation scripts
+test/                     node:test regression suite
+```
+
+## How a memory flows through Recall
+
+1. **Ingest** — `POST /v1/add` accepts raw text and stores the source document.
+2. **Extract** — the text is classified into typed facts. With a provider key, an LLM
+   returns structured JSON; otherwise the regex extractor runs. Each fact becomes a memory.
+3. **Persist** — document and memories are written in a single transaction, with embeddings
+   attached when the embedding provider is dense.
+4. **Resolve** — a new fact in an existing *slot* (location, employer, editor, …) supersedes
+   the older one; dynamic facts get an expiry derived from temporal keywords and are
+   filtered out on read once expired.
+5. **Retrieve** — `GET /v1/search` ranks memories + documents by vector cosine similarity
+   (or TF-IDF when no dense provider is available); `GET /v1/profile` returns static
+   (durable) and dynamic (temporary) facts.
+
+## Quick start
 
 ```bash
 npm install
@@ -41,11 +96,46 @@ npm start
 # open http://localhost:6767 and paste the key into the "api key" field
 ```
 
-Requires **Node.js >= 20** (developed and tested on Node 23.11). Data is stored in SQLite by
-default (`data/recall.db`).
+Requires **Node.js >= 20** (developed and tested on Node 23.11). Data is stored in SQLite
+by default (`data/recall.db`).
 
-The first request with the default provider downloads and caches `bge-base-en-v1.5`
-(~100MB). After that, search is local and key-free.
+On the first request with the default embedding provider, `bge-base-en-v1.5` (~100 MB) is
+downloaded and cached. After that, search is local and key-free.
+
+## Configuration
+
+Copy `.env.example` to `.env` (never commit it) and adjust. Everything has a working
+default; the variables below are the full surface.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | `6767` | HTTP port. |
+| `DATA_DIR` | `./data` | Base directory for the database. |
+| `STORAGE_BACKEND` | `sqlite` | `sqlite` (default) or `json` (legacy/rollback). |
+| `SQLITE_FILE` / `STORE_FILE` | `data/recall.db` / `data/store.json` | Explicit file paths. |
+| `AUTH_MODE` | `required` | `required`, or `dev` for a local single-tenant bypass. |
+| `DEV_TENANT` / `DEV_CONTAINER` | `dev` / `dev` | Tenant/container used in `dev` mode. |
+| `RATE_LIMIT_PER_MIN` | `120` | Per-key overall request budget. |
+| `RATE_LIMIT_EXPENSIVE_PER_MIN` | `30` | Budget for embedding/LLM operations. |
+| `CORS_ORIGINS` | *(off)* | Explicit comma-separated allowlist. Never a wildcard. |
+| `EMBEDDINGS_PROVIDER` | `xenova` | `xenova` \| `openai` \| `gemini` \| `tfidf`. |
+| `EMBEDDINGS_MODEL` | provider default | Override the embedding model id. |
+| `EXTRACTION_PROVIDER` | `auto` | `auto` \| `openai` \| `anthropic` \| `gemini` \| `regex`. |
+| `EXTRACTION_MODEL` | provider default | Override the extraction model id. |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY` | *(empty)* | Provider credentials. |
+
+### API-key bootstrap
+
+There is deliberately **no unauthenticated HTTP admin endpoint**. Use the offline CLI,
+which talks to the same database:
+
+```bash
+# The first key: name a tenant and a container (the container is created/claimed).
+npm run key:create -- --tenant alice --container demo_user --name "alice laptop"
+
+# Existing-data migration: adopt a pre-existing container tag.
+#   e.g. if your old tags were user_123 / demo_user, create keys with those --container values.
+```
 
 ## Authentication and multi-tenancy
 
@@ -64,19 +154,6 @@ Authorization: Bearer sm_…
 - **Ownership is enforced in the data layer** (`lib/storage`), not just in the routes, so a
   query cannot accidentally span containers.
 - `/v1/containers` is authenticated and only ever returns *your* containers.
-
-### Bootstrap (first key)
-
-There is deliberately **no unauthenticated HTTP admin endpoint**. Use the offline CLI, which
-talks to the same database:
-
-```bash
-# The first key: name a tenant and a container (the container is created/claimed).
-npm run key:create -- --tenant alice --container demo_user --name "alice laptop"
-
-# Existing data migration: point a tenant at an existing container tag to adopt its data.
-#   e.g. if your old tags were user_123 / demo_user, create keys with those --container values.
-```
 
 ### Rotation and revocation
 
@@ -124,11 +201,60 @@ from other origins, set an explicit allowlist — never a wildcard:
 CORS_ORIGINS=https://app.example.com,https://admin.example.com npm start
 ```
 
+## API
+
+All endpoints require `Authorization: Bearer <key>`. `containerTag` is an optional selector
+that must name a container your tenant owns; if omitted, the key's default container is used.
+There is no implicit `demo_user` default.
+
+```bash
+KEY=sm_…   # from `npm run key:create`
+
+# Add content — facts get extracted automatically
+curl -X POST localhost:6767/v1/add -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"content":"I am a backend engineer. I live in Berlin. I prefer Rust over Go.","containerTag":"user_123"}'
+
+# Hybrid search (memories + documents). searchMode: hybrid | memories | documents
+curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/search?q=where+does+the+user+live&containerTag=user_123&searchMode=hybrid"
+
+# User profile: static (durable) + dynamic (temporary) facts
+curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/profile?containerTag=user_123"
+
+# All memories, including superseded/expired ones (for transparency/debugging)
+curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/memories?containerTag=user_123"
+
+# Forget a memory
+curl -X DELETE -H "Authorization: Bearer $KEY" "localhost:6767/v1/memories/<id>?containerTag=user_123"
+
+# Your containers, and a self-description of the calling key
+curl -H "Authorization: Bearer $KEY" localhost:6767/v1/containers
+curl -H "Authorization: Bearer $KEY" localhost:6767/v1/whoami
+```
+
+Status codes: `400` validation error, `401` missing/invalid/revoked/expired key, `403`
+container not owned by your tenant, `404` unknown id within an owned container, `413` payload
+too large, `429` rate limited. Error bodies are generic (`{"error":"..."}`) and never leak
+secrets or internals.
+
+### Try contradiction resolution
+
+```bash
+KEY=sm_…
+
+curl -X POST localhost:6767/v1/add -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"content":"I live in Berlin.","containerTag":"user_123"}'
+
+curl -X POST localhost:6767/v1/add -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"content":"I now live in Lisbon instead.","containerTag":"user_123"}'
+
+curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/profile?containerTag=user_123"
+# -> static facts show Lisbon only; GET /v1/memories shows Berlin marked "superseded"
+```
 
 ## Storage
 
 Recall keeps its data in SQLite (WAL mode) via [`better-sqlite3`](https://github.com/WiseLibs/better-sqlite3),
-which shares a prebuilt native binary for common platforms (no compiler required). The REST
+which ships a prebuilt native binary for common platforms (no compiler required). The REST
 contract is unchanged — the storage backend sits behind `lib/storage/` and `lib/db.js` is a
 thin compatibility shim.
 
@@ -177,7 +303,51 @@ printed.
 - The JSON store is never removed automatically; delete it yourself only after you are
   satisfied the SQLite data is correct.
 
-## Testing
+## Embeddings
+
+Set `EMBEDDINGS_PROVIDER` to choose how vectors are produced:
+
+| Value | What it uses | Keys |
+|---|---|---|
+| `xenova` (default) | `@xenova/transformers` + `Xenova/bge-base-en-v1.5` | none |
+| `openai` | `text-embedding-3-small` | `OPENAI_API_KEY` |
+| `gemini` | `text-embedding-004` | `GEMINI_API_KEY` or `GOOGLE_API_KEY` |
+| `tfidf` | lexical TF-IDF (fallback path) | none |
+
+Optional: `EMBEDDINGS_MODEL` overrides the model id for the selected provider.
+
+If the local Xenova model fails to load and you have not opted into a cloud provider, search
+falls back to TF-IDF and the server logs that clearly.
+
+```bash
+# faster iteration while developing (needs a key)
+EMBEDDINGS_PROVIDER=openai OPENAI_API_KEY=sk-... npm start
+```
+
+## Extraction
+
+`POST /v1/add` classifies facts with an LLM when a key is present, then applies the same
+slot-supersession and TTL rules as the regex path. With no key, regex runs so the app still
+works offline.
+
+| `EXTRACTION_PROVIDER` | What it uses | Keys |
+|---|---|---|
+| `auto` (default) | Anthropic, else OpenAI, else Gemini, else regex | first matching key |
+| `openai` | `gpt-4o-mini` JSON schema | `OPENAI_API_KEY` |
+| `anthropic` / `claude` | `claude-3-5-haiku-latest` tool use | `ANTHROPIC_API_KEY` |
+| `gemini` | `gemini-2.0-flash` JSON schema | `GEMINI_API_KEY` or `GOOGLE_API_KEY` |
+| `regex` | pattern rules in `lib/extract/regex.js` | none |
+
+Optional: `EXTRACTION_MODEL` overrides the model id. If the LLM call fails, extraction falls
+back to regex and logs a warning.
+
+```bash
+OPENAI_API_KEY=sk-... npm start
+# or
+EXTRACTION_PROVIDER=anthropic ANTHROPIC_API_KEY=... npm start
+```
+
+## Testing and evaluations
 
 ```bash
 npm test                      # storage, migration, API, auth/isolation and shutdown tests
@@ -193,144 +363,12 @@ The auth suite (`test/auth.test.js`) covers missing/malformed/invalid/revoked/ex
 cross-tenant reads/searches/profile/enumeration/deletes for **every** data route, IDOR via
 known ids and forged container tags, hashing at rest, log redaction, rate limits, input
 validation, the dev-mode production guard, the CLI bootstrap/revocation workflow and data
-isolation after reopening the database.
-
-
-## Embeddings
-
-Set `EMBEDDINGS_PROVIDER` to choose how vectors are produced:
-
-| Value | What it uses | Keys |
-|---|---|---|
-| `xenova` (default) | `@xenova/transformers` + `Xenova/bge-base-en-v1.5` | none |
-| `openai` | `text-embedding-3-small` | `OPENAI_API_KEY` |
-| `gemini` | `text-embedding-004` | `GEMINI_API_KEY` or `GOOGLE_API_KEY` |
-| `tfidf` | lexical TF-IDF (old path) | none |
-
-Optional: `EMBEDDINGS_MODEL` overrides the model id for the selected provider.
-
-If the local Xenova model fails to load and you have not opted into a cloud provider,
-search falls back to TF-IDF and the server logs that clearly.
-
-```bash
-# faster iteration while developing (needs a key)
-EMBEDDINGS_PROVIDER=openai OPENAI_API_KEY=sk-... npm start
-```
-
-Paraphrase check (downloads the local model on first run):
-
-```bash
-npm run eval:search
-```
-
-## Extraction
-
-`POST /v1/add` classifies facts with an LLM when a key is present, then applies the same
-slot-supersession and TTL rules as the regex path. With no key, regex runs so the app
-still works offline.
-
-| `EXTRACTION_PROVIDER` | What it uses | Keys |
-|---|---|---|
-| `auto` (default) | Anthropic, else OpenAI, else Gemini, else regex | first matching key |
-| `openai` | `gpt-4o-mini` JSON schema | `OPENAI_API_KEY` |
-| `anthropic` / `claude` | `claude-3-5-haiku-latest` tool use | `ANTHROPIC_API_KEY` |
-| `gemini` | `gemini-2.0-flash` JSON schema | `GEMINI_API_KEY` or `GOOGLE_API_KEY` |
-| `regex` | pattern rules in `lib/extract/regex.js` | none |
-
-Optional: `EXTRACTION_MODEL` overrides the model id. If the LLM call fails, extraction
-falls back to regex and logs a warning.
-
-```bash
-OPENAI_API_KEY=sk-... npm start
-# or
-EXTRACTION_PROVIDER=anthropic ANTHROPIC_API_KEY=... npm start
-```
-
-```bash
-npm run eval:extract
-# live LLM cases run only when a key is set
-```
-
-## API
-
-All endpoints require `Authorization: Bearer <key>`. `containerTag` is an optional selector
-that must name a container your tenant owns; if omitted, the key's default container is used.
-There is no implicit `demo_user` default.
-
-```bash
-KEY=sm_…   # from `npm run key:create`
-
-# Add content — facts get extracted automatically
-curl -X POST localhost:6767/v1/add -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"content":"I am a backend engineer. I live in Berlin. I prefer Rust over Go.","containerTag":"user_123"}'
-
-# Hybrid search (memories + documents)
-curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/search?q=where+does+the+user+live&containerTag=user_123&searchMode=hybrid"
-
-# User profile: static (durable) + dynamic (temporary) facts
-curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/profile?containerTag=user_123"
-
-# All memories, including superseded/expired ones (for transparency/debugging)
-curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/memories?containerTag=user_123"
-
-# Forget a memory
-curl -X DELETE -H "Authorization: Bearer $KEY" "localhost:6767/v1/memories/<id>?containerTag=user_123"
-
-# Authenticated self-description (tenant, container, key id)
-curl -H "Authorization: Bearer $KEY" localhost:6767/v1/whoami
-```
-
-Status codes: `400` validation error, `401` missing/invalid/revoked/expired key, `403`
-container not owned by your tenant, `404` unknown id within an owned container, `413` payload
-too large, `429` rate limited. Error bodies are generic (`{"error":"..."}`) and never leak
-secrets or internals.
-
-## Try the contradiction resolution
-
-```bash
-KEY=sm_…   # from `npm run key:create`
-
-curl -X POST localhost:6767/v1/add -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"content":"I live in Berlin.","containerTag":"user_123"}'
-
-curl -X POST localhost:6767/v1/add -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"content":"I now live in Lisbon instead.","containerTag":"user_123"}'
-
-curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/profile?containerTag=user_123"
-# -> static facts show Lisbon only; GET /v1/memories shows Berlin marked "superseded"
-```
-
-## Project layout
-
-```
-server.js                 Express app, all routes (auth, isolation, limits, graceful shutdown)
-lib/db.js                 compatibility shim -> lib/storage
-lib/auth.js               API-key hashing/issuance + auth middleware + container authorization
-lib/ratelimit.js          in-memory per-key rate limiter
-lib/validate.js           request/identifier/container/size validation
-lib/storage/index.js      backend selection + facade (STORAGE_BACKEND)
-lib/storage/sqlite.js     SQLite backend (better-sqlite3, WAL, transactions)
-lib/storage/json.js       legacy JSON backend (rollback)
-lib/storage/migrations/   explicit SQL schema migrations (001 storage, 002 auth)
-lib/storage/vectors.js    embedding encode/decode + validation
-lib/extract.js            orchestrates LLM vs regex; persist slot/TTL mechanics
-lib/extract/              openai / anthropic / gemini structured extractors + regex
-lib/tfidf.js              TF-IDF fallback scorer
-lib/embeddings/           xenova (default) / openai / gemini / tfidf
-lib/search.js             hybrid ranking over stored vectors
-public/                   vanilla HTML/CSS/JS web UI (API-key field + authenticated calls)
-data/recall.db            SQLite store (default backend) — created on first run
-data/store.json           legacy JSON store (only with STORAGE_BACKEND=json)
-scripts/db-migrate-json.js JSON -> SQLite migration CLI
-scripts/key-cli.js        API-key bootstrap/list/revoke CLI (no HTTP admin endpoint)
-scripts/eval-search.js    paraphrase retrieval check
-scripts/eval-extract.js   regex-gap + LLM extraction check
-test/                     node:test regression suite (storage, migration, API, auth, shutdown)
-```
+isolation after reopening the database. `test/auth-race.test.js` and a data-layer test cover
+the container-claim race (see [Limitations](#limitations)).
 
 ## Limitations
 
-Recall is a single-node, self-hosted clone. Known limits, stated honestly:
+Recall is a single-node, self-hosted engine. Known limits, stated honestly:
 
 - **Single-process.** The SQLite backend keeps an in-memory mirror for the existing array read
   API. It is safe within one process (writes are committed synchronously), but it is **not
@@ -338,9 +376,11 @@ Recall is a single-node, self-hosted clone. Known limits, stated honestly:
   database would each hold a stale mirror. Do not run more than one server process against a
   database.
 - **Rate limiting is in-memory and per-process**, not distributed.
+- **Brute-force vector scoring.** Search ranks vectors in memory rather than using an indexed
+  vector store; fine for this scale, not for millions of rows.
 - **Local/offline trust model.** Authentication and tenant isolation are enforced, but the app
-  is intended to run on a trusted host behind your own network controls. Keep it off the public
-  internet unless you are deliberately exposing it and have reviewed the deployment.
+  is intended to run on a trusted host behind your own network controls. Serve it over TLS and
+  keep it off the public internet unless you have deliberately reviewed the deployment.
 - **`npm audit` dependencies.** Five advisories (4 high, 1 critical) are reported, all
   transitive through `@xenova/transformers@2.17.2` (the latest published `@xenova` release):
   - `sharp@0.32.6` (high) — image codec (libvips/libheif/librsvg) issues. The text-only
@@ -354,11 +394,26 @@ Recall is a single-node, self-hosted clone. Known limits, stated honestly:
   `@xenova/transformers` to `1.4.2` (older and worse) or requires overriding `protobufjs@6`
   with `8.x` / `sharp` across a major version that `onnx-proto` and the native binaries do not
   support. The clean path is to migrate embeddings to `@huggingface/transformers` (the
-  maintained successor, with newer `onnxruntime`/`sharp`) in a later phase. Until then these are
-  documented, not silently ignored.
+  maintained successor, with newer `onnxruntime`/`sharp`). Until then these are documented, not
+  silently ignored.
 
-## Extending it
+## Roadmap
 
-- **Persistence**: set `STORAGE_BACKEND=json` to roll back, or extend `lib/storage/` (e.g. a
-  Postgres adapter behind the same facade) and index the `embedding` BLOBs instead of scoring
-  them in memory.
+Product-oriented next steps, roughly in order:
+
+- **Migrate embeddings to `@huggingface/transformers`** — clears the transitive `npm audit`
+  advisories and tracks the maintained runtime.
+- **Indexed vector search** — move scoring out of memory (e.g. `sqlite-vec` or an external
+  vector store) behind the existing `lib/storage` facade.
+- **File ingestion** — accept documents/uploads and extract memory from them, not just raw text.
+- **Connectors** — pull from Gmail, Drive, Notion, etc. as content sources.
+- **MCP server / SDKs** — expose Recall to agents (Claude Desktop, editors) as a memory tool.
+- **Shared, multi-process deployment** — a distributed rate limiter and a stateless read path
+  so more than one process can serve the same database.
+
+## Status
+
+Functional and tested for the described scope: ingestion, extraction, persistence, retrieval,
+authentication and tenant isolation. It is a focused engineering project, **not** a
+production-hardened, horizontally-scaled service — see [Limitations](#limitations) before
+exposing it.

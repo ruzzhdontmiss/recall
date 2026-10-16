@@ -26,6 +26,8 @@ logs/
 tmp/
 uploads/
 .cache/
+models/
+coverage/
 *.tmp
 
 # OS noise
