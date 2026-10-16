@@ -176,3 +176,26 @@ test("a second connection's writes are visible after reload", (t) => {
     ["external"]
   );
 });
+
+test("supersedeSlot writes through so supersession survives reopen", (t) => {
+  const { store, file } = freshStore(t);
+  store.addDocument({ ...DOC });
+  store.addMemory({ ...MEM, id: "m1", slot: "location", text: "I live in Berlin." });
+  store.addMemory({ ...MEM, id: "m2", slot: "employer", text: "I work at Acme." });
+
+  const changed = store.supersedeSlot("u1", "location", "2024-06-01T00:00:00.000Z");
+  assert.deepEqual(changed, ["m1"]);
+  assert.equal(store.memories.find((m) => m.id === "m1").status, "superseded");
+
+  // Reopen: the supersession must be durable, not just in the in-memory mirror.
+  store.close();
+  const reopened = sqlite.create({ file });
+  try {
+    const berlin = reopened.memories.find((m) => m.id === "m1");
+    assert.equal(berlin.status, "superseded");
+    assert.equal(berlin.supersededAt, "2024-06-01T00:00:00.000Z");
+    assert.equal(reopened.memories.find((m) => m.id === "m2").status, "active");
+  } finally {
+    reopened.close();
+  }
+});

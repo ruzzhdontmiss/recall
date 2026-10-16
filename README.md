@@ -3,7 +3,9 @@
 A small, self-contained clone of the core loop in [supermemoryai/supermemory](https://github.com/supermemoryai/supermemory):
 add content → extract durable/temporary facts → build a user profile → hybrid search over memories + raw documents.
 
-No API keys required for the default path. `npm install && npm start` and it's running.
+No external services or cloud keys are required for the default path, but the API is
+**authenticated by default**: you bootstrap a local API key once, then `npm start` and it's
+running.
 
 ## What's real vs. simplified
 
@@ -27,8 +29,16 @@ The API shapes (`add`, `search` with `searchMode`, `profile` returning `static`/
 
 ```bash
 npm install
+
+# Bootstrap your first API key (offline CLI — shown once, then hashed):
+npm run key:create -- --tenant alice --container my_space
+#   API key created. This secret is shown ONCE — store it now.
+#     sm_…
+#     tenant:    alice
+#     container: my_space
+
 npm start
-# open http://localhost:6767
+# open http://localhost:6767 and paste the key into the "api key" field
 ```
 
 Requires **Node.js >= 20** (developed and tested on Node 23.11). Data is stored in SQLite by
@@ -36,6 +46,82 @@ default (`data/recall.db`).
 
 The first request with the default provider downloads and caches `bge-base-en-v1.5`
 (~100MB). After that, search is local and key-free.
+
+## Authentication and multi-tenancy
+
+All `/v1` endpoints require a bearer API key:
+
+```
+Authorization: Bearer sm_…
+```
+
+- **Keys are hashed, never stored raw.** A key is `sm_` + 32 random bytes; only its SHA-256
+  hash is persisted. The raw secret is shown **once**, when you create it.
+- **Scoped keys.** Each key maps to exactly one `tenant` and one default `container`. The
+  container named in a request (`?containerTag=…`) is a *selector*, never proof of ownership:
+  you can only touch containers your tenant owns. Supplying a container that belongs to
+  another tenant returns `403`, and so does a container you have never written to.
+- **Ownership is enforced in the data layer** (`lib/storage`), not just in the routes, so a
+  query cannot accidentally span containers.
+- `/v1/containers` is authenticated and only ever returns *your* containers.
+
+### Bootstrap (first key)
+
+There is deliberately **no unauthenticated HTTP admin endpoint**. Use the offline CLI, which
+talks to the same database:
+
+```bash
+# The first key: name a tenant and a container (the container is created/claimed).
+npm run key:create -- --tenant alice --container demo_user --name "alice laptop"
+
+# Existing data migration: point a tenant at an existing container tag to adopt its data.
+#   e.g. if your old tags were user_123 / demo_user, create keys with those --container values.
+```
+
+### Rotation and revocation
+
+```bash
+# List keys for a tenant (ids, container, created/last-used, revoked state — never the secret)
+npm run key:list -- --tenant alice
+
+# Create an additional key for the same tenant (rotation: issue new, then revoke old)
+npm run key:create -- --tenant alice --container my_space
+
+# Revoke by key id, or by presenting the raw key
+npm run key:revoke -- --tenant alice --id key_xxx
+npm run key:revoke -- --tenant alice --key sm_xxx
+```
+
+Revocation is immediate and tenant-scoped (one tenant can never revoke another's key).
+Revoked and expired keys return `401`. A key may be created with `--expires 2027-01-01T00:00:00Z`.
+
+### Local development mode
+
+For local scripting without a key you may explicitly opt in:
+
+```bash
+AUTH_MODE=dev DEV_TENANT=dev DEV_CONTAINER=dev npm start
+```
+
+Dev mode maps **every** unauthenticated request to a single configured tenant/container and
+prints a loud warning. It refuses to start when `NODE_ENV=production`. It is off unless you
+set it — authentication is never silently bypassed.
+
+### Rate limiting
+
+Per-key request limits are enforced in memory (defaults: `RATE_LIMIT_PER_MIN=120` overall,
+`RATE_LIMIT_EXPENSIVE_PER_MIN=30` for `add`/`search`). Exceeding a limit returns `429` with a
+`Retry-After` header. See [Limitations](#limitations).
+
+### CORS
+
+CORS is **off by default** (the bundled dashboard is same-origin). To allow browser clients
+from other origins, set an explicit allowlist — never a wildcard:
+
+```bash
+CORS_ORIGINS=https://app.example.com,https://admin.example.com npm start
+```
+
 
 ## Storage
 
@@ -92,7 +178,7 @@ printed.
 ## Testing
 
 ```bash
-npm test                      # storage, migration, API and shutdown regression tests
+npm test                      # storage, migration, API, auth/isolation and shutdown tests
 npm run eval:search           # paraphrase retrieval check (downloads the local model on first run)
 npm run eval:extract          # regex-gap + structured-schema check (live LLM skipped without a key)
 ```
@@ -100,6 +186,12 @@ npm run eval:extract          # regex-gap + structured-schema check (live LLM sk
 Tests use Node's built-in runner with temporary directories and never touch the real store.
 They run with `EMBEDDINGS_PROVIDER=tfidf` and `EXTRACTION_PROVIDER=regex` for speed and
 determinism; live model/LLM paths are exercised separately by the eval scripts.
+
+The auth suite (`test/auth.test.js`) covers missing/malformed/invalid/revoked/expired keys,
+cross-tenant reads/searches/profile/enumeration/deletes for **every** data route, IDOR via
+known ids and forged container tags, hashing at rest, log redaction, rate limits, input
+validation, the dev-mode production guard, the CLI bootstrap/revocation workflow and data
+isolation after reopening the database.
 
 
 ## Embeddings
@@ -159,63 +251,109 @@ npm run eval:extract
 
 ## API
 
-All endpoints take an optional `containerTag` (defaults to `demo_user`) to scope memory
-to a particular user/project — same idea as the real supermemory's `containerTag`.
+All endpoints require `Authorization: Bearer <key>`. `containerTag` is an optional selector
+that must name a container your tenant owns; if omitted, the key's default container is used.
+There is no implicit `demo_user` default.
 
 ```bash
+KEY=sm_…   # from `npm run key:create`
+
 # Add content — facts get extracted automatically
-curl -X POST localhost:6767/v1/add -H "Content-Type: application/json" \
+curl -X POST localhost:6767/v1/add -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"content":"I am a backend engineer. I live in Berlin. I prefer Rust over Go.","containerTag":"user_123"}'
 
 # Hybrid search (memories + documents)
-curl "localhost:6767/v1/search?q=where+does+the+user+live&containerTag=user_123&searchMode=hybrid"
+curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/search?q=where+does+the+user+live&containerTag=user_123&searchMode=hybrid"
 
 # User profile: static (durable) + dynamic (temporary) facts
-curl "localhost:6767/v1/profile?containerTag=user_123"
+curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/profile?containerTag=user_123"
 
 # All memories, including superseded/expired ones (for transparency/debugging)
-curl "localhost:6767/v1/memories?containerTag=user_123"
+curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/memories?containerTag=user_123"
 
 # Forget a memory
-curl -X DELETE localhost:6767/v1/memories/<id>
+curl -X DELETE -H "Authorization: Bearer $KEY" "localhost:6767/v1/memories/<id>?containerTag=user_123"
+
+# Authenticated self-description (tenant, container, key id)
+curl -H "Authorization: Bearer $KEY" localhost:6767/v1/whoami
 ```
+
+Status codes: `400` validation error, `401` missing/invalid/revoked/expired key, `403`
+container not owned by your tenant, `404` unknown id within an owned container, `413` payload
+too large, `429` rate limited. Error bodies are generic (`{"error":"..."}`) and never leak
+secrets or internals.
 
 ## Try the contradiction resolution
 
 ```bash
-curl -X POST localhost:6767/v1/add -H "Content-Type: application/json" \
+KEY=sm_…   # from `npm run key:create`
+
+curl -X POST localhost:6767/v1/add -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"content":"I live in Berlin.","containerTag":"user_123"}'
 
-curl -X POST localhost:6767/v1/add -H "Content-Type: application/json" \
+curl -X POST localhost:6767/v1/add -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"content":"I now live in Lisbon instead.","containerTag":"user_123"}'
 
-curl "localhost:6767/v1/profile?containerTag=user_123"
+curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/profile?containerTag=user_123"
 # -> static facts show Lisbon only; GET /v1/memories shows Berlin marked "superseded"
 ```
 
 ## Project layout
 
 ```
-server.js                 Express app, all routes (+ graceful shutdown)
+server.js                 Express app, all routes (auth, isolation, limits, graceful shutdown)
 lib/db.js                 compatibility shim -> lib/storage
+lib/auth.js               API-key hashing/issuance + auth middleware + container authorization
+lib/ratelimit.js          in-memory per-key rate limiter
+lib/validate.js           request/identifier/container/size validation
 lib/storage/index.js      backend selection + facade (STORAGE_BACKEND)
 lib/storage/sqlite.js     SQLite backend (better-sqlite3, WAL, transactions)
 lib/storage/json.js       legacy JSON backend (rollback)
-lib/storage/migrations/   explicit SQL schema migrations
+lib/storage/migrations/   explicit SQL schema migrations (001 storage, 002 auth)
 lib/storage/vectors.js    embedding encode/decode + validation
 lib/extract.js            orchestrates LLM vs regex; persist slot/TTL mechanics
 lib/extract/              openai / anthropic / gemini structured extractors + regex
 lib/tfidf.js              TF-IDF fallback scorer
 lib/embeddings/           xenova (default) / openai / gemini / tfidf
 lib/search.js             hybrid ranking over stored vectors
-public/                   vanilla HTML/CSS/JS web UI
+public/                   vanilla HTML/CSS/JS web UI (API-key field + authenticated calls)
 data/recall.db            SQLite store (default backend) — created on first run
 data/store.json           legacy JSON store (only with STORAGE_BACKEND=json)
 scripts/db-migrate-json.js JSON -> SQLite migration CLI
+scripts/key-cli.js        API-key bootstrap/list/revoke CLI (no HTTP admin endpoint)
 scripts/eval-search.js    paraphrase retrieval check
 scripts/eval-extract.js   regex-gap + LLM extraction check
-test/                     node:test regression suite
+test/                     node:test regression suite (storage, migration, API, auth, shutdown)
 ```
+
+## Limitations
+
+Recall is a single-node, self-hosted clone. Known limits, stated honestly:
+
+- **Single-process.** The SQLite backend keeps an in-memory mirror for the existing array read
+  API. It is safe within one process (writes are committed synchronously), but it is **not
+  multi-process consistent and not horizontally scalable**: two server processes sharing one
+  database would each hold a stale mirror. Do not run more than one server process against a
+  database.
+- **Rate limiting is in-memory and per-process**, not distributed.
+- **Local/offline trust model.** Authentication and tenant isolation are enforced, but the app
+  is intended to run on a trusted host behind your own network controls. Keep it off the public
+  internet unless you are deliberately exposing it and have reviewed the deployment.
+- **`npm audit` dependencies.** Five advisories (4 high, 1 critical) are reported, all
+  transitive through `@xenova/transformers@2.17.2` (the latest published `@xenova` release):
+  - `sharp@0.32.6` (high) — image codec (libvips/libheif/librsvg) issues. The text-only
+    embedding path never exercises `sharp`.
+  - `protobufjs@6.11.6` via `onnxruntime-web@1.14.0` → `onnx-proto@4.0.4` (critical) — protobuf
+    code-generation/DoS issues reachable when deserializing ONNX model protobufs. This app only
+    loads the trusted `Xenova/bge-base-en-v1.5` model; do not point `EMBEDDINGS_MODEL` at an
+    untrusted model.
+
+  There is **no non-breaking fix**: `npm audit fix --force` would downgrade
+  `@xenova/transformers` to `1.4.2` (older and worse) or requires overriding `protobufjs@6`
+  with `8.x` / `sharp` across a major version that `onnx-proto` and the native binaries do not
+  support. The clean path is to migrate embeddings to `@huggingface/transformers` (the
+  maintained successor, with newer `onnxruntime`/`sharp`) in a later phase. Until then these are
+  documented, not silently ignored.
 
 ## Extending it
 

@@ -12,6 +12,9 @@
     "dev": "node server.js",
     "test": "node --test test/*.test.js",
     "db:migrate-json": "node scripts/db-migrate-json.js",
+    "key:create": "node scripts/key-cli.js create",
+    "key:list": "node scripts/key-cli.js list",
+    "key:revoke": "node scripts/key-cli.js revoke",
     "eval:search": "node scripts/eval-search.js",
     "eval:extract": "node scripts/eval-extract.js"
   },

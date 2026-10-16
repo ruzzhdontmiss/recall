@@ -1,3 +1,6 @@
+const KEY_STORAGE = "recall_api_key";
+
+const apiKeyInput = document.getElementById("apiKey");
 const tagInput = document.getElementById("containerTag");
 const tagList = document.getElementById("containerTags");
 
@@ -16,14 +19,27 @@ const staticEmpty = document.getElementById("staticEmpty");
 const dynamicEmpty = document.getElementById("dynamicEmpty");
 const docFeed = document.getElementById("docFeed");
 
-function tag() {
-  return tagInput.value.trim() || "demo_user";
+function apiKey() {
+  return (apiKeyInput.value || localStorage.getItem(KEY_STORAGE) || "").trim();
 }
 
-async function api(path, opts) {
-  const res = await fetch(path, opts);
-  if (!res.ok) throw new Error((await res.json()).error || res.statusText);
-  return res.json();
+// An empty space means "use the container the API key is bound to".
+function tag() {
+  return tagInput.value.trim();
+}
+
+async function api(path, opts = {}) {
+  const headers = { ...(opts.headers || {}) };
+  const key = apiKey();
+  if (key) headers.Authorization = `Bearer ${key}`;
+  const res = await fetch(path, { ...opts, headers });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(body.error || res.statusText);
+    err.status = res.status;
+    throw err;
+  }
+  return body;
 }
 
 function timeAgo(iso) {
@@ -36,11 +52,17 @@ function timeAgo(iso) {
 
 async function refreshContainers() {
   const { containerTags } = await api("/v1/containers");
-  tagList.innerHTML = containerTags.map((t) => `<option value="${t}">`).join("");
+  tagList.innerHTML = containerTags.map((t) => `<option value="${escapeHtml(t)}">`).join("");
+}
+
+async function refreshWhoami() {
+  const me = await api("/v1/whoami");
+  if (!tagInput.value) tagInput.placeholder = `default: ${me.containerTag}`;
 }
 
 async function refreshProfile() {
-  const { profile } = await api(`/v1/profile?containerTag=${encodeURIComponent(tag())}`);
+  const query = tag() ? `?containerTag=${encodeURIComponent(tag())}` : "";
+  const { profile } = await api(`/v1/profile${query}`);
 
   staticList.innerHTML = profile.static
     .map((f) => `<li>${escapeHtml(f.text)}${f.slot ? `<span class="meta">${f.slot}</span>` : ""}</li>`)
@@ -57,7 +79,8 @@ async function refreshProfile() {
 }
 
 async function refreshDocs() {
-  const { documents } = await api(`/v1/documents?containerTag=${encodeURIComponent(tag())}`);
+  const query = tag() ? `?containerTag=${encodeURIComponent(tag())}` : "";
+  const { documents } = await api(`/v1/documents${query}`);
   if (!documents.length) {
     docFeed.innerHTML = `<li class="empty-hint">nothing captured yet in this space</li>`;
     return;
@@ -72,11 +95,17 @@ async function refreshDocs() {
 }
 
 function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
 async function refreshAll() {
-  await Promise.all([refreshContainers(), refreshProfile(), refreshDocs()]);
+  try {
+    await Promise.all([refreshWhoami(), refreshContainers(), refreshProfile(), refreshDocs()]);
+  } catch (e) {
+    if (e.status === 401) {
+      addStatus.textContent = "enter a valid API key to continue";
+    }
+  }
 }
 
 addBtn.addEventListener("click", async () => {
@@ -85,10 +114,12 @@ addBtn.addEventListener("click", async () => {
   addBtn.disabled = true;
   addStatus.textContent = "extracting…";
   try {
+    const payload = { content };
+    if (tag()) payload.containerTag = tag();
     const res = await api("/v1/add", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content, containerTag: tag() }),
+      body: JSON.stringify(payload),
     });
     addStatus.textContent = `stored · ${res.memoriesExtracted} fact${res.memoriesExtracted === 1 ? "" : "s"} extracted`;
     contentEl.value = "";
@@ -104,19 +135,24 @@ addBtn.addEventListener("click", async () => {
 async function runSearch() {
   const q = searchInput.value.trim();
   if (!q) return;
-  const { results } = await api(
-    `/v1/search?q=${encodeURIComponent(q)}&containerTag=${encodeURIComponent(tag())}&searchMode=${searchMode.value}`
-  );
-  if (!results.length) {
-    searchResults.innerHTML = `<li class="empty-hint">no matches — try different wording, or add more memories first</li>`;
-    return;
+  const t = tag() ? `&containerTag=${encodeURIComponent(tag())}` : "";
+  try {
+    const { results } = await api(
+      `/v1/search?q=${encodeURIComponent(q)}${t}&searchMode=${searchMode.value}`
+    );
+    if (!results.length) {
+      searchResults.innerHTML = `<li class="empty-hint">no matches — try different wording, or add more memories first</li>`;
+      return;
+    }
+    searchResults.innerHTML = results
+      .map(
+        (r) =>
+          `<li><span class="result-tag result-tag--${r.source}">${r.source}</span><span class="result-score">${r.score}</span>${escapeHtml(r.text)}</li>`
+      )
+      .join("");
+  } catch (e) {
+    searchResults.innerHTML = `<li class="empty-hint">error: ${escapeHtml(e.message)}</li>`;
   }
-  searchResults.innerHTML = results
-    .map(
-      (r) =>
-        `<li><span class="result-tag result-tag--${r.source}">${r.source}</span><span class="result-score">${r.score}</span>${escapeHtml(r.text)}</li>`
-    )
-    .join("");
 }
 
 searchBtn.addEventListener("click", runSearch);
@@ -124,5 +160,13 @@ searchInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") runSearch();
 });
 tagInput.addEventListener("change", refreshAll);
+
+apiKeyInput.addEventListener("change", () => {
+  localStorage.setItem(KEY_STORAGE, apiKeyInput.value.trim());
+  refreshAll();
+});
+
+// Restore a previously entered key (stored locally in this browser only).
+apiKeyInput.value = localStorage.getItem(KEY_STORAGE) || "";
 
 refreshAll();

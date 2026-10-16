@@ -5,6 +5,9 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const net = require("net");
+const { spawnSync } = require("node:child_process");
+
+const KEY_CLI = path.join(__dirname, "..", "scripts", "key-cli.js");
 
 function mkTmp(prefix = "recall-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -35,8 +38,9 @@ function freePort() {
 async function waitReady(port, tries = 60) {
   for (let i = 0; i < tries; i++) {
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/v1/containers`);
-      if (res.ok) return true;
+      // Any HTTP response means the server is up; 401 is expected without a key.
+      await fetch(`http://127.0.0.1:${port}/v1/whoami`);
+      return true;
     } catch {
       /* not up yet */
     }
@@ -45,4 +49,23 @@ async function waitReady(port, tries = 60) {
   throw new Error(`server on port ${port} did not become ready`);
 }
 
-module.exports = { mkTmp, rm, sleep, freePort, waitReady };
+// Run the offline key CLI against a directory, returning its parsed --json output.
+function runKeyCli(dir, args, { backend = "sqlite" } = {}) {
+  const res = spawnSync(process.execPath, [KEY_CLI, ...args], {
+    env: { ...process.env, DATA_DIR: dir, STORAGE_BACKEND: backend },
+    encoding: "utf-8",
+  });
+  if (res.status !== 0) {
+    throw new Error(`key-cli ${args.join(" ")} failed: ${res.stderr || res.stdout}`);
+  }
+  return res.stdout;
+}
+
+function createKey(dir, { tenant, container = null, name = null, backend = "sqlite" } = {}) {
+  const args = ["create", "--tenant", tenant, "--json"];
+  if (container) args.push("--container", container);
+  if (name) args.push("--name", name);
+  return JSON.parse(runKeyCli(dir, args, { backend })).key;
+}
+
+module.exports = { mkTmp, rm, sleep, freePort, waitReady, runKeyCli, createKey, KEY_CLI };

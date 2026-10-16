@@ -9,14 +9,20 @@ process.env.DATA_DIR = DIR;
 process.env.STORAGE_BACKEND = "sqlite";
 process.env.EMBEDDINGS_PROVIDER = "tfidf";
 process.env.EXTRACTION_PROVIDER = "regex";
+process.env.AUTH_MODE = "required";
 
 const { app } = require("../server");
 const db = require("../lib/db");
+const { issueApiKey } = require("../lib/auth");
 
 let server;
 let base;
+let KEY;
 
 before(async () => {
+  // A single tenant owns every container used in this file; the key is bound to
+  // container "api_a". Cross-tenant isolation is covered in test/auth.test.js.
+  ({ key: KEY } = issueApiKey(db, { tenantId: "api", containerTag: "api_a" }));
   await new Promise((resolve) => {
     server = app.listen(0, resolve);
   });
@@ -29,8 +35,9 @@ after(async () => {
   rm(DIR);
 });
 
-async function json(pathname, opts) {
-  const res = await fetch(base + pathname, opts);
+async function json(pathname, opts = {}) {
+  const headers = { Authorization: `Bearer ${KEY}`, ...(opts.headers || {}) };
+  const res = await fetch(base + pathname, { ...opts, headers });
   const body = await res.json().catch(() => null);
   return { status: res.status, body };
 }
@@ -65,8 +72,10 @@ test("profile, memories and documents are scoped to the container", async () => 
   const docs = await json("/v1/documents?containerTag=api_b");
   assert.ok(docs.body.documents.every((d) => d.containerTag === "api_b"));
 
+  // A container the tenant has never written to is not owned yet -> denied
+  // (never silently auto-created on a read).
   const other = await json("/v1/profile?containerTag=api_does_not_exist");
-  assert.deepEqual(other.body.profile.static, []);
+  assert.equal(other.status, 403);
 });
 
 test("contradiction supersedes the previous fact", async () => {
@@ -95,6 +104,10 @@ test("cross-container deletion is blocked (IDOR regression)", async () => {
   await postAdd("I live in Berlin.", "victim");
   const victimMem = (await json("/v1/memories?containerTag=victim")).body.memories[0];
 
+  // Claim a second, unrelated container for the same tenant so the request is
+  // authorized but the id belongs to a different container.
+  await postAdd("unrelated note", "attacker");
+
   const attack = await json(`/v1/memories/${victimMem.id}?containerTag=attacker`, { method: "DELETE" });
   assert.equal(attack.status, 404, "a cross-container delete must not succeed");
 
@@ -122,7 +135,7 @@ test("unknown id returns 404", async () => {
 test("malformed JSON returns 400 with a safe message", async () => {
   const res = await fetch(base + "/v1/add", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${KEY}` },
     body: '{"content":"oops',
   });
   assert.equal(res.status, 400);
@@ -132,7 +145,7 @@ test("malformed JSON returns 400 with a safe message", async () => {
 test("oversized payload returns 413 with a safe message", async () => {
   const res = await fetch(base + "/v1/add", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${KEY}` },
     body: JSON.stringify({ content: "x".repeat(2_200_000) }),
   });
   assert.equal(res.status, 413);
@@ -154,7 +167,7 @@ test("sensitive request content never appears in server logs", async () => {
   try {
     await fetch(base + "/v1/add", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${KEY}` },
       body: `{"content":"${MARKER}`,
     });
   } finally {
@@ -162,5 +175,7 @@ test("sensitive request content never appears in server logs", async () => {
     console.warn = originalWarn;
   }
   assert.ok(captured.length > 0, "the error should have been logged");
-  assert.ok(!captured.join("\n").includes(MARKER), "raw body content must not be logged");
+  const logs = captured.join("\n");
+  assert.ok(!logs.includes(MARKER), "raw body content must not be logged");
+  assert.ok(!logs.includes(KEY), "the API key must not be logged");
 });

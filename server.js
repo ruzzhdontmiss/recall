@@ -4,6 +4,15 @@ const path = require("path");
 const db = require("./lib/db");
 const { classifyContent, persistFacts, effectiveStatus } = require("./lib/extract");
 const embeddings = require("./lib/embeddings");
+const { issueApiKey, createAuthMiddleware, authorizeContainer } = require("./lib/auth");
+const { createLimiter, createRateLimitMiddleware } = require("./lib/ratelimit");
+const {
+  validateContent,
+  validateQuery,
+  isValidContainerTag,
+  isValidId,
+  isValidSearchMode,
+} = require("./lib/validate");
 const {
   embedIngestTexts,
   searchDocuments,
@@ -14,7 +23,33 @@ const {
 
 const PORT = process.env.PORT || 6767;
 
-const DEFAULT_TAG = "demo_user";
+function toPosInt(value, fallback) {
+  const n = Number.parseInt(value, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+// Configuration is read per createApp() call so tests can build isolated apps
+// with different auth/limit settings.
+function readConfig(env = process.env) {
+  const authMode = (env.AUTH_MODE || "required").toLowerCase().trim();
+  if (authMode !== "required" && authMode !== "dev") {
+    throw new Error(`unknown AUTH_MODE=${authMode} (expected "required" or "dev")`);
+  }
+  if (authMode === "dev" && env.NODE_ENV === "production") {
+    throw new Error("AUTH_MODE=dev is not allowed when NODE_ENV=production");
+  }
+  return {
+    authMode,
+    devTenant: env.DEV_TENANT || "dev",
+    devContainer: env.DEV_CONTAINER || "dev",
+    generalMax: toPosInt(env.RATE_LIMIT_PER_MIN, 120),
+    expensiveMax: toPosInt(env.RATE_LIMIT_EXPENSIVE_PER_MIN, 30),
+    corsOrigins: String(env.CORS_ORIGINS || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  };
+}
 
 function asyncRoute(fn) {
   return (req, res, next) => {
@@ -22,22 +57,102 @@ function asyncRoute(fn) {
   };
 }
 
-function createApp() {
+function createApp(config = readConfig()) {
   const app = express();
+
+  // -------------------------------------------------------- hardening -----
+  app.use((req, res, next) => {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    next();
+  });
+
+  // CORS is off by default (same-origin dashboard). An explicit allowlist can be
+  // opted into with CORS_ORIGINS; there is never a wildcard with credentials.
+  if (config.corsOrigins.length) {
+    app.use((req, res, next) => {
+      const origin = req.headers.origin;
+      if (origin && config.corsOrigins.includes(origin)) {
+        res.setHeader("Access-Control-Allow-Origin", origin);
+        res.setHeader("Vary", "Origin");
+        res.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "Authorization,Content-Type");
+        res.setHeader("Access-Control-Max-Age", "600");
+      }
+      if (req.method === "OPTIONS") return res.sendStatus(204);
+      next();
+    });
+  }
 
   app.use(express.json({ limit: "2mb" }));
   app.use(express.static(path.join(__dirname, "public")));
+
+  // ----------------------------------------------------------- auth ------
+  if (config.authMode === "dev") {
+    // Provision the dev container so local reads work without an explicit add.
+    db.claimContainer(config.devContainer, config.devTenant);
+    console.warn(
+      `[auth] WARNING: AUTH_MODE=dev — all /v1 requests are treated as tenant ` +
+        `"${config.devTenant}" container "${config.devContainer}". Never use this in production.`
+    );
+  }
+
+  const auth = createAuthMiddleware({
+    db,
+    mode: config.authMode,
+    devTenant: config.devTenant,
+    devContainer: config.devContainer,
+  });
+
+  const identify = (req) =>
+    req.auth && req.auth.keyId ? `key:${req.auth.keyId}` : `ip:${req.ip || "unknown"}`;
+  const ipLimiter = createRateLimitMiddleware({
+    limiter: createLimiter({ max: config.generalMax * 4 }),
+    identify: (req) => `ip:${req.ip || "unknown"}`,
+  });
+  const generalLimiter = createRateLimitMiddleware({
+    limiter: createLimiter({ max: config.generalMax }),
+    identify,
+  });
+  const expensiveLimiter = createRateLimitMiddleware({
+    limiter: createLimiter({ max: config.expensiveMax }),
+    identify,
+  });
+
+  app.use("/v1", ipLimiter, auth, generalLimiter);
+
+  // Resolve and authorize the request's container against the authenticated
+  // tenant. Returns the container tag, or null after sending 400/403.
+  function resolveTag(req, res, { claim = false } = {}) {
+    const requested =
+      (req.query && req.query.containerTag) ||
+      (req.body && req.body.containerTag) ||
+      null;
+    const result = authorizeContainer(db, req.auth, requested, { claim });
+    if (!result.ok) {
+      if (result.reason === "invalid") {
+        res.status(400).json({ error: "invalid containerTag" });
+      } else {
+        res.status(403).json({ error: "forbidden" });
+      }
+      return null;
+    }
+    return result.tag;
+  }
 
   // -------------------------------------------------------------- add -----
   // POST /v1/add  { content, containerTag? }
   app.post(
     "/v1/add",
+    expensiveLimiter,
     asyncRoute(async (req, res) => {
-      const { content, containerTag } = req.body || {};
-      if (!content || typeof content !== "string" || !content.trim()) {
-        return res.status(400).json({ error: "content is required" });
-      }
-      const tag = containerTag || DEFAULT_TAG;
+      const { content } = req.body || {};
+      const invalid = validateContent(content);
+      if (invalid) return res.status(invalid.status).json({ error: invalid.error });
+
+      const tag = resolveTag(req, res, { claim: true });
+      if (!tag) return;
       const now = new Date();
 
       const draft = {
@@ -83,20 +198,25 @@ function createApp() {
   // GET /v1/search?q=...&containerTag=...&searchMode=hybrid|memories|documents
   app.get(
     "/v1/search",
+    expensiveLimiter,
     asyncRoute(async (req, res) => {
-      const { q } = req.query;
-      const tag = req.query.containerTag || DEFAULT_TAG;
-      const mode = req.query.searchMode || "hybrid";
-      if (!q) return res.status(400).json({ error: "q is required" });
+      const { q, searchMode } = req.query;
+      const qError = validateQuery(q);
+      if (qError) return res.status(qError.status).json({ error: qError.error });
+
+      const mode = searchMode || "hybrid";
+      if (!isValidSearchMode(mode)) {
+        return res.status(400).json({ error: "invalid searchMode" });
+      }
+
+      const tag = resolveTag(req, res, { claim: false });
+      if (!tag) return;
 
       const now = new Date();
+      const docs = db.listDocuments(tag);
+      const mems = db.listMemories(tag).filter((m) => effectiveStatus(m, now) === "active");
+
       let results = [];
-
-      const docs = db.documents.filter((d) => d.containerTag === tag);
-      const mems = db.memories.filter(
-        (m) => m.containerTag === tag && effectiveStatus(m, now) === "active"
-      );
-
       if (mode === "documents") {
         results = await searchDocuments(q, docs);
       } else if (mode === "memories") {
@@ -119,10 +239,15 @@ function createApp() {
   app.get(
     "/v1/profile",
     asyncRoute(async (req, res) => {
-      const tag = req.query.containerTag || DEFAULT_TAG;
+      const tag = resolveTag(req, res, { claim: false });
+      if (!tag) return;
+      if (req.query.q !== undefined) {
+        const qError = validateQuery(req.query.q);
+        if (qError) return res.status(qError.status).json({ error: qError.error });
+      }
       const now = new Date();
 
-      const mems = db.memories.filter((m) => m.containerTag === tag);
+      const mems = db.listMemories(tag);
       const staticFacts = mems.filter(
         (m) => m.type === "static" && effectiveStatus(m, now) === "active"
       );
@@ -152,10 +277,11 @@ function createApp() {
   // ----------------------------------------------------------- memories ---
   // GET /v1/memories?containerTag=...  (includes superseded/expired, for transparency)
   app.get("/v1/memories", (req, res) => {
-    const tag = req.query.containerTag || DEFAULT_TAG;
+    const tag = resolveTag(req, res, { claim: false });
+    if (!tag) return;
     const now = new Date();
-    const mems = db.memories
-      .filter((m) => m.containerTag === tag)
+    const mems = db
+      .listMemories(tag)
       .map((m) => ({ ...db.publicMemory(m), effectiveStatus: effectiveStatus(m, now) }))
       .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
     res.json({ containerTag: tag, memories: mems });
@@ -163,9 +289,13 @@ function createApp() {
 
   // DELETE /v1/memories/:id?containerTag=...  -- "forget"
   // Ownership is enforced at the data-access boundary: a memory can only be
-  // forgotten when its containerTag matches the request scope.
+  // forgotten when its containerTag matches the authenticated container.
   app.delete("/v1/memories/:id", (req, res) => {
-    const tag = req.query.containerTag || DEFAULT_TAG;
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: "invalid id" });
+    }
+    const tag = resolveTag(req, res, { claim: false });
+    if (!tag) return;
     const mem = db.forgetMemory(req.params.id, tag);
     if (!mem) return res.status(404).json({ error: "not found" });
     res.json({ ok: true });
@@ -173,17 +303,31 @@ function createApp() {
 
   // ---------------------------------------------------------- documents ---
   app.get("/v1/documents", (req, res) => {
-    const tag = req.query.containerTag || DEFAULT_TAG;
-    const docs = db.documents
-      .filter((d) => d.containerTag === tag)
+    const tag = resolveTag(req, res, { claim: false });
+    if (!tag) return;
+    const docs = db
+      .listDocuments(tag)
       .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
       .map(db.publicDocument);
     res.json({ containerTag: tag, documents: docs });
   });
 
-  app.get("/v1/containers", (_req, res) => {
-    const tags = new Set(db.documents.map((d) => d.containerTag));
-    res.json({ containerTags: Array.from(tags) });
+  // --------------------------------------------------------- containers ---
+  // Authenticated, and only ever returns containers owned by the caller.
+  app.get("/v1/containers", (req, res) => {
+    const tags = db.listContainers(req.auth.tenantId).map((c) => c.containerTag);
+    res.json({ containerTags: tags });
+  });
+
+  // ------------------------------------------------------------ whoami ----
+  // Small authenticated self-description, handy for verifying bootstrap.
+  app.get("/v1/whoami", (req, res) => {
+    res.json({
+      tenantId: req.auth.tenantId,
+      keyId: req.auth.keyId,
+      containerTag: req.auth.defaultContainer,
+      authMode: config.authMode,
+    });
   });
 
   // ------------------------------------------------------------- errors ---
@@ -259,4 +403,4 @@ if (require.main === module) {
   process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
-module.exports = { app, createApp, attachShutdown };
+module.exports = { app, createApp, readConfig, attachShutdown, issueApiKey };
