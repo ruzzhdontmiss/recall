@@ -1,0 +1,17 @@
+{
+  "name": "supermemory-clone",
+  "version": "0.1.0",
+  "description": "A self-hosted clone of the core supermemory.ai loop: add content, extract memories, build a user profile, hybrid search. Zero external services required.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "eval:search": "node scripts/eval-search.js",
+    "eval:extract": "node scripts/eval-extract.js"
+  },
+  "dependencies": {
+    "@xenova/transformers": "^2.17.2",
+    "express": "^4.19.2"
+  }
+}

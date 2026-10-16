@@ -1,0 +1,23 @@
+{
+  "home-is": { "facts": [{ "type": "static", "text": "Lives in Lisbon", "slot": "location", "slotValue": "Lisbon", "ttlDays": null }] },
+  "employed-by": { "facts": [{ "type": "static", "text": "Employed by Acme Corp", "slot": "employer", "slotValue": "Acme Corp", "ttlDays": null }] },
+  "office-at": { "facts": [{ "type": "static", "text": "Works at Stripe", "slot": "employer", "slotValue": "Stripe", "ttlDays": null }] },
+  "fr-live": { "facts": [{ "type": "static", "text": "Lives in Paris", "slot": "location", "slotValue": "Paris", "ttlDays": null }] },
+  "es-live": { "facts": [{ "type": "static", "text": "Lives in Madrid", "slot": "location", "slotValue": "Madrid", "ttlDays": null }] },
+  "de-live": { "facts": [{ "type": "static", "text": "Lives in Berlin", "slot": "location", "slotValue": "Berlin", "ttlDays": null }] },
+  "relocated": { "facts": [{ "type": "static", "text": "Relocated to Austin", "slot": "location", "slotValue": "Austin", "ttlDays": null }] },
+  "staff-cern": { "facts": [{ "type": "static", "text": "Staff engineer at CERN", "slot": "employer", "slotValue": "CERN", "ttlDays": null }] },
+  "neovim": { "facts": [{ "type": "static", "text": "Uses Neovim as editor", "slot": "editor", "slotValue": "Neovim", "ttlDays": null }] },
+  "allergy": { "facts": [{ "type": "static", "text": "Allergic to peanuts", "slot": "allergy", "slotValue": "peanuts", "ttlDays": null }] },
+  "pet": { "facts": [{ "type": "static", "text": "Dog named Mochi", "slot": "pet", "slotValue": "Mochi", "ttlDays": null }] },
+  "home-city": { "facts": [{ "type": "static", "text": "Home city is Oslo", "slot": "location", "slotValue": "Oslo", "ttlDays": null }] },
+  "role-colon": { "facts": [{ "type": "static", "text": "Product designer", "slot": "role", "slotValue": "product designer", "ttlDays": null }] },
+  "helix": { "facts": [{ "type": "static", "text": "Editor of choice is Helix", "slot": "editor", "slotValue": "Helix", "ttlDays": null }] },
+  "daughter": { "facts": [{ "type": "static", "text": "Daughter named Asha", "slot": "family", "slotValue": "Asha", "ttlDays": null }] },
+  "timezone": { "facts": [{ "type": "static", "text": "Timezone is Europe/Lisbon", "slot": "timezone", "slotValue": "Europe/Lisbon", "ttlDays": null }] },
+  "based-out": { "facts": [{ "type": "static", "text": "Based out of Tokyo", "slot": "location", "slotValue": "Tokyo", "ttlDays": null }] },
+  "ships-friday": { "facts": [{ "type": "dynamic", "text": "Shipping the billing rewrite this Friday", "slot": null, "slotValue": null, "ttlDays": 7 }] },
+  "dark-mode": { "facts": [{ "type": "static", "text": "Prefers dark mode everywhere", "slot": "preference", "slotValue": "dark mode", "ttlDays": null }] },
+  "researcher-not-lawyer": { "facts": [{ "type": "static", "text": "Works as a researcher, not a lawyer", "slot": "role", "slotValue": "researcher", "ttlDays": null }] },
+  "retract-berlin": { "facts": [{ "type": "static", "text": "Lives in Lisbon", "slot": "location", "slotValue": "Lisbon", "ttlDays": null }] }
+}

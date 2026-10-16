@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>recall — a supermemory clone</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">◐</span>
+      <span class="brand-name">recall</span>
+    </div>
+    <div class="container-select">
+      <label for="containerTag">space</label>
+      <input id="containerTag" list="containerTags" value="demo_user" spellcheck="false" />
+      <datalist id="containerTags"></datalist>
+    </div>
+  </header>
+
+  <main class="layout">
+
+    <!-- LEFT: profile -->
+    <aside class="profile-pane">
+      <h2 class="pane-title">who this is</h2>
+      <p class="pane-sub">durable facts, kept until something contradicts them</p>
+      <ul id="staticList" class="fact-list fact-list--static"></ul>
+      <p class="empty-note" id="staticEmpty">nothing durable learned yet — add a memory below</p>
+
+      <h2 class="pane-title pane-title--spaced">right now</h2>
+      <p class="pane-sub">temporary context, expires on its own</p>
+      <ul id="dynamicList" class="fact-list fact-list--dynamic"></ul>
+      <p class="empty-note" id="dynamicEmpty">no active short-term context</p>
+    </aside>
+
+    <!-- RIGHT: capture + search -->
+    <section class="main-pane">
+
+      <div class="card capture-card">
+        <h2 class="pane-title">add a memory</h2>
+        <p class="pane-sub">paste a message, a note, anything. facts get pulled out automatically.</p>
+        <textarea id="content" rows="4" placeholder="e.g. I'm a backend engineer, I live in Berlin, and I prefer Rust over Go. I'm currently working on a rate limiter and it's due this week."></textarea>
+        <div class="row">
+          <button id="addBtn" class="btn btn--primary">Add to memory</button>
+          <span id="addStatus" class="status-text"></span>
+        </div>
+      </div>
+
+      <div class="card search-card">
+        <h2 class="pane-title">search</h2>
+        <div class="row">
+          <input id="searchInput" type="text" placeholder="ask anything about this space…" />
+          <select id="searchMode">
+            <option value="hybrid">hybrid (memory + docs)</option>
+            <option value="memories">memories only</option>
+            <option value="documents">documents only</option>
+          </select>
+          <button id="searchBtn" class="btn">Search</button>
+        </div>
+        <ul id="searchResults" class="result-list"></ul>
+      </div>
+
+      <div class="card feed-card">
+        <h2 class="pane-title">recent captures</h2>
+        <ul id="docFeed" class="doc-feed"></ul>
+      </div>
+
+    </section>
+  </main>
+
+  <footer class="footnote">
+    local, heuristic clone of <a href="https://github.com/supermemoryai/supermemory" target="_blank" rel="noopener">supermemoryai/supermemory</a> —
+    extraction runs on pattern rules and TF-IDF, not an LLM or real embeddings.
+  </footer>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
