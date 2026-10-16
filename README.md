@@ -109,9 +109,11 @@ set it — authentication is never silently bypassed.
 
 ### Rate limiting
 
-Per-key request limits are enforced in memory (defaults: `RATE_LIMIT_PER_MIN=120` overall,
-`RATE_LIMIT_EXPENSIVE_PER_MIN=30` for `add`/`search`). Exceeding a limit returns `429` with a
-`Retry-After` header. See [Limitations](#limitations).
+Per-key request limits are enforced **in memory, in a single process** (defaults:
+`RATE_LIMIT_PER_MIN=120` overall, `RATE_LIMIT_EXPENSIVE_PER_MIN=30` for the embedding/LLM
+operations: `POST /v1/add`, `GET /v1/search`, and `GET /v1/profile` when a `q` is supplied).
+Exceeding a limit returns `429` with a `Retry-After` header. Counters are not shared across
+processes — see [Limitations](#limitations).
 
 ### CORS
 

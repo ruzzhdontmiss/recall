@@ -119,6 +119,10 @@ function createApp(config = readConfig()) {
     limiter: createLimiter({ max: config.expensiveMax }),
     identify,
   });
+  // /v1/profile only embeds (an expensive operation) when `q` is present, so it
+  // is charged to the expensive budget only then.
+  const expensiveIfQuery = (req, res, next) =>
+    req.query && req.query.q ? expensiveLimiter(req, res, next) : next();
 
   app.use("/v1", ipLimiter, auth, generalLimiter);
 
@@ -238,6 +242,7 @@ function createApp(config = readConfig()) {
   // GET /v1/profile?containerTag=...&q=optional
   app.get(
     "/v1/profile",
+    expensiveIfQuery,
     asyncRoute(async (req, res) => {
       const tag = resolveTag(req, res, { claim: false });
       if (!tag) return;

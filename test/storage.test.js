@@ -177,6 +177,55 @@ test("a second connection's writes are visible after reload", (t) => {
   );
 });
 
+test("auth migrations are applied once and are idempotent", (t) => {
+  const { store, file } = freshStore(t);
+  const versions = store.db
+    .prepare("SELECT version FROM schema_migrations ORDER BY version")
+    .all()
+    .map((r) => r.version);
+  assert.deepEqual(versions, ["001_init.sql", "002_auth.sql"]);
+
+  const tables = store.db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+    .all()
+    .map((r) => r.name);
+  for (const table of ["documents", "memories", "containers", "api_keys"]) {
+    assert.ok(tables.includes(table), `${table} must exist`);
+  }
+
+  // Re-opening must not re-run migrations (idempotent) or throw on existing tables.
+  const again = sqlite.create({ file });
+  try {
+    const versions2 = again.db
+      .prepare("SELECT version FROM schema_migrations ORDER BY version")
+      .all()
+      .map((r) => r.version);
+    assert.deepEqual(versions2, versions);
+  } finally {
+    again.close();
+  }
+});
+
+test("claimContainer returns false (never throws) when another tenant wins the insert race", (t) => {
+  const { store } = freshStore(t);
+  store.db
+    .prepare("INSERT INTO containers (container_tag, tenant_id, created_at) VALUES (?, ?, ?)")
+    .run("race_tag", "other_tenant", "2024-01-01T00:00:00.000Z");
+
+  // Force the TOCTOU window: the first ownership lookup misses (the competing
+  // row is not "visible" to us yet), then the INSERT hits the existing row.
+  const realGet = store.getContainer.bind(store);
+  let calls = 0;
+  store.getContainer = (tag) => {
+    calls += 1;
+    return calls === 1 ? null : realGet(tag);
+  };
+
+  const claimed = store.claimContainer("race_tag", "my_tenant");
+  assert.equal(claimed, false, "a lost race must return false, not throw");
+  assert.equal(realGet("race_tag").tenantId, "other_tenant", "ownership must never be overwritten");
+});
+
 test("supersedeSlot writes through so supersession survives reopen", (t) => {
   const { store, file } = freshStore(t);
   store.addDocument({ ...DOC });

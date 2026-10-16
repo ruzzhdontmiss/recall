@@ -130,6 +130,9 @@ function main() {
       console.error("usage: key-cli.js <create|list|revoke> [options]");
       process.exitCode = 1;
     }
+  } catch (err) {
+    // Clean, secret-free failure (e.g. a container another tenant already owns).
+    fail(err && err.message ? err.message : String(err));
   } finally {
     try {
       db.close();

@@ -122,6 +122,20 @@ test("an expired key is rejected", async () => {
   assert.equal((await req("/v1/whoami", { key: expired })).status, 401);
 });
 
+test("rotation: multiple keys for one tenant/container coexist, and revoking one keeps the other", async () => {
+  const { key: k1, record: r1 } = issueApiKey(db, { tenantId: "rotate", containerTag: "rot_space" });
+  const { key: k2, record: r2 } = issueApiKey(db, { tenantId: "rotate", containerTag: "rot_space" });
+  assert.notEqual(k1, k2);
+  assert.notEqual(r1.id, r2.id);
+  assert.notEqual(r1.keyHash, r2.keyHash);
+  assert.equal((await req("/v1/whoami", { key: k1 })).status, 200);
+  assert.equal((await req("/v1/whoami", { key: k2 })).status, 200);
+
+  db.revokeApiKey(r1.id, "rotate", new Date().toISOString());
+  assert.equal((await req("/v1/whoami", { key: k1 })).status, 401);
+  assert.equal((await req("/v1/whoami", { key: k2 })).status, 200, "the other key must keep working");
+});
+
 // ------------------------------------------------------- tenant isolation --
 
 test("a tenant can add to and read its own container", async () => {
@@ -302,6 +316,11 @@ test("the stricter expensive limit applies to search and add", async (t) => {
 
   assert.equal((await call("/v1/search?q=berlin&containerTag=alpha")).status, 200);
   assert.equal((await call("/v1/search?q=berlin&containerTag=alpha")).status, 429);
+
+  // Profile without `q` does not embed, so it is not charged the expensive budget.
+  assert.equal((await call("/v1/profile?containerTag=alpha")).status, 200);
+  // Profile with `q` embeds the query and is charged the expensive budget.
+  assert.equal((await call("/v1/profile?containerTag=alpha&q=berlin")).status, 429);
 
   assert.equal(
     (
