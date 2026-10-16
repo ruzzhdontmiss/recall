@@ -283,10 +283,13 @@ function createApp(config = readConfig()) {
         results = await searchMemories(q, mems);
       } else {
         // Uploaded files are searchable at chunk granularity; raw-text documents
-        // (which have no chunks) keep the original document-level ranking.
+        // (which have no chunks) keep the original document-level ranking. Failed
+        // uploads are never ranked or embedded (they have empty content and would
+        // otherwise surface as empty hits, or break a provider that rejects empty
+        // input).
         const chunks = db.listChunks(tag);
         const docById = new Map(docs.map((d) => [d.id, d]));
-        const plainDocs = docs.filter((d) => !d.chunkCount);
+        const plainDocs = docs.filter((d) => d.status !== "failed" && !d.chunkCount);
         if (mode === "documents") {
           results = await searchDocumentsWithChunks({ q, docs: plainDocs, chunks, docById });
         } else {
@@ -410,8 +413,12 @@ function createApp(config = readConfig()) {
     if (doc.storageKey) {
       try {
         fileStore.remove(doc.storageKey);
-      } catch (err) {
-        console.warn(`[documents] stored file cleanup failed: ${err.message}`);
+      } catch (cleanupErr) {
+        // Log a safe code only: a filesystem error message can embed an absolute
+        // path, and we must not leak server paths (or the file name) into logs.
+        console.warn(
+          `[documents] stored file cleanup failed (code=${(cleanupErr && cleanupErr.code) || "unknown"})`
+        );
       }
     }
     res.json({ ok: true });
