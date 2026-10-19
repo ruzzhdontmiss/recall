@@ -249,24 +249,37 @@ async function runSearch() {
   if (!q) return;
   searchResults.innerHTML = `<li class="empty-hint">searching…</li>`;
   try {
-    const { results } = await api(
+    const { results, ranking, embeddingsProvider } = await api(
       `/v1/search${containerParam({ q, searchMode: searchMode.value })}`
     );
+    // Be honest about how the results were ranked: never present a lexical
+    // fallback as semantic search.
+    const note =
+      ranking === "dense"
+        ? ""
+        : `<li class="empty-hint">ranked lexically${
+            embeddingsProvider === "uninitialized"
+              ? " — the embedding provider is unavailable"
+              : ""
+          }; matching is keyword-based, not semantic</li>`;
     if (!results.length) {
-      searchResults.innerHTML = `<li class="empty-hint">no matches — try different wording, or add more memories first</li>`;
+      searchResults.innerHTML =
+        note + `<li class="empty-hint">no matches — try different wording, or add more memories first</li>`;
       return;
     }
-    searchResults.innerHTML = results
-      .map((r) => {
-        const where =
-          r.source === "chunk"
-            ? `<span class="meta-inline">${escapeHtml(r.filename || "document")}${r.page ? ` · page ${r.page}` : ""}</span>`
-            : "";
-        return `<li><span class="result-tag result-tag--${escapeHtml(r.source)}">${escapeHtml(
-          r.source
-        )}</span><span class="result-score">${r.score}</span>${escapeHtml(snippet(r.text))}${where}</li>`;
-      })
-      .join("");
+    searchResults.innerHTML =
+      note +
+      results
+        .map((r) => {
+          const where =
+            r.source === "chunk"
+              ? `<span class="meta-inline">${escapeHtml(r.filename || "document")}${r.page ? ` · page ${r.page}` : ""}</span>`
+              : "";
+          return `<li><span class="result-tag result-tag--${escapeHtml(r.source)}">${escapeHtml(
+            r.source
+          )}</span><span class="result-score">${r.score}</span>${escapeHtml(snippet(r.text))}${where}</li>`;
+        })
+        .join("");
   } catch (e) {
     searchResults.innerHTML = `<li class="empty-hint">error: ${escapeHtml(e.message)}</li>`;
   }

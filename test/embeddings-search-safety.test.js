@@ -183,7 +183,7 @@ test("stale chunk whose re-embed throws is not scored; lexical fallback remains"
   }
 });
 
-test("stale document whose re-embed returns a falsy vector is not scored", async () => {
+test("stale document whose re-embed returns a falsy vector is not scored densely", async () => {
   const id = "doc-falsy";
   const tag = "df";
   seedForeignDoc(id, tag, "alpha beta");
@@ -199,14 +199,27 @@ test("stale document whose re-embed returns a falsy vector is not scored", async
   });
   try {
     const hits = await search.searchDocuments("alpha", [doc]);
-    assert.equal(hits.length, 0, "a row that cannot be re-embedded must not be scored");
+    assert.ok(
+      !hits.some((h) => Math.abs(h.score - DENSE_LEAK) < 1e-9),
+      "the foreign vector must never receive a dense score"
+    );
+    // The whole set falls back to lexical (never a silent, partial dense result):
+    // the row stays retrievable, ranked by text rather than by the stale vector.
+    const expected = buildIndex([{ id, text: doc.content }])
+      .score("alpha")
+      .find((r) => r.id === id);
+    assert.equal(hits.length, 1, "the row must stay retrievable via lexical fallback");
+    assert.ok(
+      Math.abs(hits[0].score - Number(expected.score.toFixed(4))) < 1e-9,
+      "score must be the (rounded) lexical score"
+    );
   } finally {
     restoreEmb();
     restoreEnv();
   }
 });
 
-test("stale memory whose re-embed returns a falsy vector is not scored", async () => {
+test("stale memory whose re-embed returns a falsy vector is not scored densely", async () => {
   const docId = "doc-mem";
   const memId = "mem-falsy";
   const tag = "dm";
@@ -223,14 +236,25 @@ test("stale memory whose re-embed returns a falsy vector is not scored", async (
   });
   try {
     const hits = await search.searchMemories("alpha", [mem]);
-    assert.equal(hits.length, 0, "a memory that cannot be re-embedded must not be scored");
+    assert.ok(
+      !hits.some((h) => Math.abs(h.score - DENSE_LEAK) < 1e-9),
+      "the foreign vector must never receive a dense score"
+    );
+    const expected = buildIndex([{ id: memId, text: mem.text }])
+      .score("alpha")
+      .find((r) => r.id === memId);
+    assert.equal(hits.length, 1, "the memory must stay retrievable via lexical fallback");
+    assert.ok(
+      Math.abs(hits[0].score - Number(expected.score.toFixed(4))) < 1e-9,
+      "score must be the (rounded) lexical score"
+    );
   } finally {
     restoreEmb();
     restoreEnv();
   }
 });
 
-test("stale document whose re-embed throws is not scored", async () => {
+test("stale document whose re-embed throws is not scored densely", async () => {
   const id = "doc-throw";
   const tag = "dt";
   seedForeignDoc(id, tag, "alpha");
@@ -247,7 +271,11 @@ test("stale document whose re-embed throws is not scored", async () => {
   });
   try {
     const hits = await search.searchDocuments("alpha", [doc]);
-    assert.equal(hits.length, 0, "a row whose re-embed throws must not be scored");
+    assert.ok(
+      !hits.some((h) => Math.abs(h.score - DENSE_LEAK) < 1e-9),
+      "the foreign vector must never receive a dense score"
+    );
+    assert.equal(hits.length, 1, "the row must stay retrievable via lexical fallback");
   } finally {
     restoreEmb();
     restoreEnv();

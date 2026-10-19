@@ -317,6 +317,9 @@ curl -X POST localhost:6767/v1/add -H "Authorization: Bearer $KEY" -H "Content-T
   -d '{"content":"I am a backend engineer. I live in Berlin. I prefer Rust over Go.","containerTag":"user_123"}'
 
 # Hybrid search (memories + documents). searchMode: hybrid | memories | documents
+# -> { results, searchMode, containerTag, embeddingsProvider, ranking }
+#    `ranking` is "dense" | "lexical" | "none" — it reports how THIS response was
+#    actually ranked, so a lexical fallback is never reported as semantic search.
 curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/search?q=where+does+the+user+live&containerTag=user_123&searchMode=hybrid"
 
 # User profile: static (durable) + dynamic (temporary) facts
@@ -555,9 +558,16 @@ npm run embeddings:reindex -- --apply # re-embed, then record the new space
 ```
 
 If a stale vector cannot be re-embedded (provider error, or an empty/falsy response), that row is
-excluded from dense scoring rather than compared against a foreign vector; chunk search falls
-back to lexical ranking for the whole set. A failed reindex never records the space, so the next
-startup keeps warning until it is complete.
+never compared against a foreign vector. Ranking is **all-or-nothing**: if any row in a result set
+cannot be placed in the current space — or the provider cannot load at all — the whole set is
+ranked lexically (TF-IDF), so content is never silently dropped and two spaces are never mixed in
+one response. A failed reindex never records the space, so the next startup keeps warning until it
+is complete.
+
+Every search response carries an authoritative `ranking` field (`dense` | `lexical` | `none`)
+describing how *that* response was actually ranked, so a degraded/lexical result can never be
+mistaken for semantic search; `embeddingsProvider` separately names the loaded provider. A provider
+that cannot load degrades search to lexical with HTTP `200` (it does not fail the request).
 
 **Hosted providers** (`openai`, `gemini`) record the configured model id only. If a provider
 changes its server-side model behaviour without changing the id, Recall cannot detect it and the

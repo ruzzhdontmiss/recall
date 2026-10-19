@@ -10,7 +10,7 @@ process.env.EXTRACTION_PROVIDER = process.env.EXTRACTION_PROVIDER || "regex";
 
 const db = require("../lib/db");
 const { extractMemories, effectiveStatus } = require("../lib/extract");
-const { attachOnIngest, searchMemories } = require("../lib/search");
+const { attachOnIngest, searchMemories, createRankingState, rankingMode } = require("../lib/search");
 const embeddings = require("../lib/embeddings");
 
 const QUERY = "where does the user work";
@@ -36,10 +36,13 @@ async function main() {
 
   const provider = embeddings.getProviderName();
   const active = db.memories.filter((m) => effectiveStatus(m, now) === "active");
-  const hits = await searchMemories(QUERY, active);
+  const rankingState = createRankingState();
+  const hits = await searchMemories(QUERY, active, rankingState);
+  const ranking = rankingMode(rankingState);
   const top = hits[0];
 
   console.log(`provider: ${provider}`);
+  console.log(`ranking:  ${ranking}`);
   console.log(`ingested: ${CONTENT}`);
   console.log(`query:    ${QUERY}`);
   console.log(`top hit:  ${top ? `${top.score}  ${top.text}` : "(none)"}`);
@@ -48,6 +51,11 @@ async function main() {
   if (provider === "tfidf") {
     throw new Error(
       "still on tf-idf (xenova did not load). Semantic paraphrase match is not expected."
+    );
+  }
+  if (ranking !== "dense") {
+    throw new Error(
+      `search fell back to lexical ranking (ranking=${ranking}); this is not a semantic match`
     );
   }
   if (!ok) {

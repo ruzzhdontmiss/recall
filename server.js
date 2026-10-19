@@ -19,6 +19,8 @@ const {
   searchHybrid,
   searchProfile,
   searchDocumentsWithChunks,
+  createRankingState,
+  rankingMode,
 } = require("./lib/search");
 const { ingestUpload } = require("./lib/documents/ingest");
 const fileStore = require("./lib/documents/storage");
@@ -355,9 +357,12 @@ function createApp(config = readConfig()) {
       const docs = db.listDocuments(tag);
       const mems = db.listMemories(tag).filter((m) => effectiveStatus(m, now) === "active");
 
+      // Records how ranking was actually produced so the response can report the
+      // truth (dense vs lexical) rather than only the configured provider.
+      const rankingState = createRankingState();
       let results = [];
       if (mode === "memories") {
-        results = await searchMemories(q, mems);
+        results = await searchMemories(q, mems, rankingState);
       } else {
         // Uploaded files are searchable at chunk granularity; raw-text documents
         // (which have no chunks) keep the original document-level ranking. Failed
@@ -368,9 +373,15 @@ function createApp(config = readConfig()) {
         const docById = new Map(docs.map((d) => [d.id, d]));
         const plainDocs = docs.filter((d) => d.status !== "failed" && !d.chunkCount);
         if (mode === "documents") {
-          results = await searchDocumentsWithChunks({ q, docs: plainDocs, chunks, docById });
+          results = await searchDocumentsWithChunks({
+            q,
+            docs: plainDocs,
+            chunks,
+            docById,
+            state: rankingState,
+          });
         } else {
-          results = await searchHybrid({ q, docs: plainDocs, mems, chunks, docById });
+          results = await searchHybrid({ q, docs: plainDocs, mems, chunks, docById, state: rankingState });
         }
       }
 
@@ -378,7 +389,12 @@ function createApp(config = readConfig()) {
         results: results.slice(0, 20),
         searchMode: mode,
         containerTag: tag,
+        // The loaded provider, and the ranking this specific response actually
+        // used. `ranking` is authoritative: it is "lexical" whenever any part of
+        // the result fell back to TF-IDF (so a caller never mistakes a lexical
+        // response for a semantic one).
         embeddingsProvider: embeddings.getProviderName(),
+        ranking: rankingMode(rankingState),
       });
     })
   );
@@ -415,12 +431,19 @@ function createApp(config = readConfig()) {
       };
 
       let searchResults = undefined;
+      const rankingState = createRankingState();
       if (req.query.q) {
         const active = mems.filter((m) => effectiveStatus(m, now) === "active");
-        searchResults = await searchProfile(req.query.q, active);
+        searchResults = await searchProfile(req.query.q, active, 10, rankingState);
       }
 
-      res.json({ containerTag: tag, profile, searchResults });
+      res.json({
+        containerTag: tag,
+        profile,
+        searchResults,
+        // Only meaningful when a query was supplied; "none" otherwise.
+        ranking: rankingMode(rankingState),
+      });
     })
   );
 
