@@ -409,6 +409,31 @@ printed.
 - The JSON store is never removed automatically; delete it yourself only after you are
   satisfied the SQLite data is correct.
 
+### Reconcile files with records
+
+Uploaded files live on disk under `UPLOAD_DIR` while their records live in the database, so a
+crash between the two, an interrupted delete, or a manual file copy can leave them out of step.
+`storage:reconcile` reports both directions and (only with `--apply`) deletes files that no
+record references:
+
+```bash
+npm run storage:reconcile                 # dry run: report only
+npm run storage:reconcile -- --apply      # delete orphaned files
+npm run storage:reconcile -- --json       # machine-readable report
+```
+
+Safety properties:
+
+- **Records are never modified.** Only unreferenced *files* are deleted; a record whose file is
+  missing is reported and left untouched so provenance is preserved.
+- **A grace period (default 1 hour)** protects files newer than the window, so a concurrent
+  upload that has committed its file but not yet inserted its row is never mistaken for an
+  orphan. Override with `--grace-ms <n>` or `STORAGE_RECONCILE_GRACE_MS`.
+- **Transient filesystem errors are not proof.** A file or directory that cannot be read is
+  reported and skipped, never deleted.
+- **Idempotent**, works on both backends, skips `UPLOAD_DIR/tmp`, and exits non-zero if a delete
+  fails or the directory cannot be read. Stop the server first for the most accurate result.
+
 ### Embedding-space rollback
 
 Restoring the previous **code and dependencies** is *not* sufficient on its own. The previous
