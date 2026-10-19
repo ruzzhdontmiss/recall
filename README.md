@@ -139,6 +139,7 @@ default; the variables below are the full surface.
 | Variable | Default | Purpose |
 |---|---|---|
 | `PORT` | `6767` | HTTP port. |
+| `HOST` | `127.0.0.1` | Bind address. Loopback by default; set `0.0.0.0` only behind TLS/firewall with `AUTH_MODE=required`. |
 | `DATA_DIR` | `./data` | Base directory for the database. |
 | `STORAGE_BACKEND` | `sqlite` | `sqlite` (default) or `json` (legacy/rollback). |
 | `SQLITE_FILE` / `STORE_FILE` | `data/recall.db` / `data/store.json` | Explicit file paths. |
@@ -276,6 +277,31 @@ from other origins, set an explicit allowlist — never a wildcard:
 ```bash
 CORS_ORIGINS=https://app.example.com,https://admin.example.com npm start
 ```
+
+### Network exposure
+
+Recall binds to **`127.0.0.1` by default**, so a fresh install is not reachable from another
+machine until you deliberately set `HOST=0.0.0.0` (or a specific interface). If you bind to a
+non-loopback address the server logs a warning to that effect. Before exposing it:
+
+1. Keep `AUTH_MODE=required` (the server refuses `dev` when `NODE_ENV=production`).
+2. Put TLS in front (a reverse proxy) — Recall speaks plain HTTP.
+3. Restrict reachability with a firewall or private network; never publish it directly.
+
+Defence-in-depth that is always on:
+
+- **Every `/v1` route requires a bearer key**; the dashboard page itself holds no data and no
+  secrets (it prompts for a key, kept only in the browser's `localStorage`).
+- **Strict browser headers** on every response: a self-only `Content-Security-Policy`,
+  `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
+  `Cross-Origin-Opener-Policy`/`-Resource-Policy: same-origin`, and a locked-down
+  `Permissions-Policy`. `X-Powered-By` is disabled.
+- **CSRF does not apply**: authentication is a bearer token in a header (no cookies, no ambient
+  credentials), so a cross-site form cannot authenticate a state-changing request.
+- **Uploads are validated by magic bytes** and stored under server-generated names — the client
+  filename is metadata only, so path traversal is impossible.
+- **Errors are generic and redacted** — no stack traces, paths or secrets reach the client, and
+  request bodies/headers are never logged.
 
 ## API
 

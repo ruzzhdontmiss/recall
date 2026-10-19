@@ -44,6 +44,9 @@ function readConfig(env = process.env) {
   }
   return {
     authMode,
+    // Bind to loopback by default so a fresh install is never reachable from
+    // another machine until the operator explicitly opts in (HOST=0.0.0.0).
+    host: env.HOST && env.HOST.trim() ? env.HOST.trim() : "127.0.0.1",
     devTenant: env.DEV_TENANT || "dev",
     devContainer: env.DEV_CONTAINER || "dev",
     generalMax: toPosInt(env.RATE_LIMIT_PER_MIN, 120),
@@ -53,6 +56,23 @@ function readConfig(env = process.env) {
       .map((s) => s.trim())
       .filter(Boolean),
   };
+}
+
+// The dashboard loads its fonts from Google Fonts; everything else is same-origin.
+// `style-src` therefore allows that stylesheet origin and `font-src` its files.
+function contentSecurityPolicy() {
+  return [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' https://fonts.googleapis.com",
+    "font-src https://fonts.gstatic.com",
+    "img-src 'self' data:",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+  ].join("; ");
 }
 
 function asyncRoute(fn) {
@@ -65,10 +85,19 @@ function createApp(config = readConfig()) {
   const app = express();
 
   // -------------------------------------------------------- hardening -----
+  // Do not advertise the framework, and send a strict, self-only policy so a
+  // future XSS in the dashboard cannot exfiltrate the API key or load remote
+  // code. No cookies or ambient credentials are ever used, so CORS/CSRF is a
+  // browser-read concern only (a cross-site <form> cannot send Authorization).
+  app.disable("x-powered-by");
   app.use((req, res, next) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("X-Frame-Options", "DENY");
     res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("Content-Security-Policy", contentSecurityPolicy());
+    res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+    res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+    res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
     next();
   });
 
@@ -490,6 +519,16 @@ function createApp(config = readConfig()) {
     });
   });
 
+  // --------------------------------------------------------------- 404 ----
+  // Unknown API paths answer with JSON (never the framework's HTML page, which
+  // would advertise the stack); everything else gets a plain 404.
+  app.use((req, res) => {
+    if (req.path === "/v1" || req.path.startsWith("/v1/")) {
+      return res.status(404).json({ error: "not found" });
+    }
+    res.status(404).type("text/plain").send("not found");
+  });
+
   // ------------------------------------------------------------- errors ---
   // Structured, redacted error handling. Never logs request bodies, headers,
   // secrets or stack traces; never returns internal detail to the client.
@@ -566,8 +605,16 @@ function attachShutdown(server, { timeoutMs = 10000 } = {}) {
 }
 
 if (require.main === module) {
-  const server = app.listen(PORT, async () => {
-    console.log(`Recall running at http://localhost:${PORT}`);
+  const config = readConfig();
+  const server = app.listen(PORT, config.host, async () => {
+    console.log(`Recall running at http://${config.host}:${PORT}`);
+    const loopback = ["127.0.0.1", "::1", "localhost"].includes(config.host);
+    if (!loopback) {
+      console.warn(
+        `[server] WARNING: bound to ${config.host} (reachable from other machines). ` +
+          "Ensure AUTH_MODE=required, a firewall, and TLS in front of it."
+      );
+    }
     await embeddings.warmup();
     app.checkEmbeddingSpace();
   });
