@@ -617,6 +617,26 @@ Tests use Node's built-in runner with temporary directories and never touch the 
 They run with `EMBEDDINGS_PROVIDER=tfidf` and `EXTRACTION_PROVIDER=regex` for speed and
 determinism; live model/LLM paths are exercised separately by the eval scripts.
 
+### Runtime and platform
+
+- **Node ≥ 22.** Declared in `package.json` (`engines`) and pinned by `.nvmrc` (`22`); `.npmrc`
+  sets `engine-strict=true` so an unsupported Node fails the install instead of producing a tree
+  that will not run.
+- **Reproducible installs.** Dependencies resolve from `package-lock.json`; use `npm ci` (never
+  `npm install` in deployment). A clean `npm ci` from the committed lockfile installs the full
+  tree with **0 audit vulnerabilities** and the whole suite passes.
+- **Native modules.** Local embeddings run on `onnxruntime-node` and `sharp`, which ship prebuilt
+  platform binaries. `npm ls` shows a few `extraneous` / `UNMET OPTIONAL DEPENDENCY` entries for
+  *other* platforms (Windows, Linux/musl variants) — this is expected npm behaviour for optional
+  platform packages and `npm ci` reproduces it exactly; it is not a broken tree.
+- **Model cache.** `EMBEDDINGS_CACHE_DIR` defaults inside `node_modules`, so a container must
+  mount a persistent volume for it (or point it elsewhere) to avoid re-downloading the model on
+  every start.
+- **Cross-platform.** The suite is verified on macOS (darwin-arm64). macOS verification does not
+  prove a Linux/container target; validate that explicitly with the provided container recipe
+  before deployment.
+
+
 The document suite (`test/documents.test.js`, `test/rank-chunks.test.js`) covers happy-path
 txt/md/pdf ingestion with page/chunk attribution, every rejection path (empty, unsupported,
 mismatched MIME, fake magic bytes, binary-as-text, oversize, traversal filename), the chunk and
