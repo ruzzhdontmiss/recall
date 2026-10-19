@@ -92,8 +92,10 @@ searchable at passage granularity:
    page count, extracted length and chunk count are all bounded. Anything else is rejected.
 2. **Deduplicate** — the SHA-256 of the bytes identifies an identical, already-processed upload
    in the same container; it returns the existing document and creates no new chunks.
-3. **Extract** — text is pulled per page for PDFs (via `unpdf`) and normalized; parsing has a
-   wall-clock timeout and a page cap.
+3. **Extract** — text is pulled per page for PDFs and normalized. PDF parsing runs in a
+   dedicated **worker thread**, never in the main server process: each job has a wall-clock
+   deadline (the thread is terminated when it expires), the number of concurrent parsers and
+   the queue behind them are bounded, and a parser crash or timeout fails only that upload.
 4. **Chunk** — text is split into overlapping passages (paragraph/sentence-aware) with character
    offsets and, for PDFs, the page number.
 5. **Embed** — chunks are embedded in batches when a dense provider is configured; embedding is
@@ -157,7 +159,10 @@ default; the variables below are the full surface.
 | `UPLOAD_DIR` | `DATA_DIR/uploads` | Private directory for uploaded files (dirs `0700`, files `0600`). |
 | `MAX_UPLOAD_BYTES` | `10485760` (10 MiB) | Hard cap on a single uploaded file. |
 | `MAX_PDF_PAGES` | `500` | Reject PDFs with more pages. |
-| `PDF_EXTRACT_TIMEOUT_MS` | `20000` | Wall-clock bound on PDF parsing. |
+| `PDF_EXTRACT_TIMEOUT_MS` | `20000` | Wall-clock bound on PDF parsing; the worker thread is terminated when exceeded. |
+| `PDF_MAX_CONCURRENT` | `2` | PDFs parsed at once (one worker thread each). |
+| `PDF_MAX_QUEUE` | `64` | Uploads that may wait for a PDF worker slot before the API returns `503` (`pdf_busy`). |
+| `PDF_WORKER_HEAP_MB` | `0` | Per-worker V8 old-space cap in MiB (`0` = Node default). |
 | `MAX_EXTRACTED_CHARS` | `2000000` | Reject documents that extract more text than this. |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `1200` / `200` | Chunking window and overlap (characters). |
 | `MAX_CHUNKS` | `2000` | Reject documents that produce more chunks. |
@@ -304,9 +309,11 @@ bodies are generic (`{"error":"..."}`) and never leak secrets, absolute paths or
 
 - **Supported now:** `.txt`, `.md`, `.pdf` (text extraction; no OCR). Word/audio/code and
   scanned/image-only PDFs are out of scope for this phase.
-- **Synchronous pipeline.** Uploads are processed in the request; there is no queue. Small and
-  medium files are fine, but a very large PDF holds the request open (bounded by
-  `PDF_EXTRACT_TIMEOUT_MS`).
+- **Synchronous pipeline, isolated parser.** Uploads are processed in the request; there is no
+  queue. PDF parsing runs in a bounded pool of worker threads (`PDF_MAX_CONCURRENT` active,
+  `PDF_MAX_QUEUE` waiting) so it can never run unbounded in the server. A job that exceeds
+  `PDF_EXTRACT_TIMEOUT_MS` is terminated and fails with `pdf_timeout`; when the wait queue is
+  full the API returns `503` (`pdf_busy`) rather than buffering without bound.
 - **Private storage.** Files are written under `UPLOAD_DIR` with server-generated names
   (`<uuid>.<ext>`) and `0600` permissions. The client's filename is stored as metadata only and
   is never used to build a path — path traversal is not possible.
@@ -314,7 +321,14 @@ bodies are generic (`{"error":"..."}`) and never leak secrets, absolute paths or
   bytes creates a *new* document whose `previousDocumentId` points at the prior version; both
   are retained and searchable until you delete one.
 - **Failed uploads** are recorded with `status:"failed"` and an `errorCode` (e.g.
-  `pdf_unreadable`), create no chunks, leave no file, and never block a later retry.
+  `pdf_unreadable`), create no chunks, leave no file, and never block a later retry. A PDF that
+  times out, crashes the parser, or is rejected by a limit is recorded the same way and is never
+  exposed as searchable.
+- **Bounds that are best-effort.** `PDF_EXTRACT_TIMEOUT_MS` terminates the worker thread, but a
+  hard memory limit inside a PDF parser cannot be fully enforced by `PDF_WORKER_HEAP_MB` alone
+  (a worker can also be killed externally, e.g. by the OS OOM killer); such a job fails cleanly
+  rather than corrupting state. Deadline enforcement is wall-clock, so a machine under heavy
+  load may terminate a job that would otherwise have finished.
 - **Retrieval without embeddings.** When the embedding provider is lexical, or chunk embedding
   fails, chunk ranking falls back to TF-IDF so uploaded content stays searchable.
 
@@ -538,10 +552,12 @@ Recall is a single-node, self-hosted engine. Known limits, stated honestly:
 - **Brute-force vector scoring.** Search ranks vectors in memory rather than using an indexed
   vector store; fine for this scale, not for millions of rows.
 - **Document ingestion is synchronous and local-disk based.** Uploads are processed inline (no
-  queue), so a very large PDF holds the request open until `PDF_EXTRACT_TIMEOUT_MS`. Files are
-  kept on the server's local disk under `UPLOAD_DIR` (not object storage) and must be backed up
-  together with the database. Text extraction only: scanned/image-only PDFs and non-text formats
-  (Word, audio, code) are not supported, and there is no OCR.
+  queue). PDF parsing is isolated in worker threads whose concurrency and queue are bounded
+  (`PDF_MAX_CONCURRENT` / `PDF_MAX_QUEUE`), and each job is terminated once it exceeds
+  `PDF_EXTRACT_TIMEOUT_MS`. Files are kept on the server's local disk under `UPLOAD_DIR` (not
+  object storage) and must be backed up together with the database. Text extraction only:
+  scanned/image-only PDFs and non-text formats (Word, audio, code) are not supported, and there
+  is no OCR.
 - **Local/offline trust model.** Authentication and tenant isolation are enforced, but the app
   is intended to run on a trusted host behind your own network controls. Serve it over TLS and
   keep it off the public internet unless you have deliberately reviewed the deployment.

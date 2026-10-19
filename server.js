@@ -22,6 +22,7 @@ const {
 } = require("./lib/search");
 const { ingestUpload } = require("./lib/documents/ingest");
 const fileStore = require("./lib/documents/storage");
+const { shutdownPdfWorkers } = require("./lib/documents/pdf");
 const { readConfig: readDocConfig } = require("./lib/documents/config");
 
 const PORT = process.env.PORT || 6767;
@@ -530,6 +531,13 @@ function attachShutdown(server, { timeoutMs = 10000 } = {}) {
     if (closing) return;
     closing = true;
     console.log(`[server] ${signal} received — shutting down`);
+    // Terminate in-flight PDF workers first so any pending upload fails fast
+    // instead of holding the socket open until the deadline.
+    try {
+      shutdownPdfWorkers();
+    } catch {
+      /* best-effort worker termination */
+    }
     const force = setTimeout(() => {
       console.error("[server] graceful shutdown timed out — forcing exit");
       process.exit(1);
