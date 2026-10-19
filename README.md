@@ -48,7 +48,8 @@ mechanics end-to-end in readable code so they can be studied, extended, and self
 ## Architecture
 
 ```
-server.js                 Express app: routes, auth, tenant isolation, limits, shutdown
+server.js                 Express app: routes, auth, tenant isolation, limits, health, shutdown
+lib/config.js             env reading + fail-fast validation (server + document limits)
 lib/auth.js               API-key issuance/hashing, auth middleware, container authorization
 lib/validate.js           request / identifier / container / payload-size validation
 lib/ratelimit.js          in-memory per-key rate limiter
@@ -58,15 +59,16 @@ lib/storage/sqlite.js     SQLite backend (better-sqlite3, WAL, transactions, ind
 lib/storage/json.js       legacy JSON backend (kept for rollback)
 lib/storage/migrations/   explicit SQL schema migrations (001 storage, 002 auth, 003 documents)
 lib/storage/vectors.js    embedding encode/decode + validation
-lib/documents/            upload pipeline: storage, extract (txt/md/pdf), chunk, ingest
+lib/documents/            upload pipeline: storage, extract (txt/md/pdf), pdf-worker, chunk, ingest
 lib/extract.js            orchestrates LLM vs regex; applies slot/TTL mechanics
 lib/extract/              openai / anthropic / gemini structured extractors + regex
 lib/embeddings/           xenova (default) / openai / gemini / tfidf
 lib/search.js             hybrid ranking over stored vectors
 lib/tfidf.js              TF-IDF fallback scorer
 public/                   vanilla HTML/CSS/JS dashboard (API-key field + authenticated calls)
-scripts/                  key CLI, JSON→SQLite migration, and evaluation scripts
+scripts/                  key CLI, migrations, evaluation scripts, smoke test + matrix
 test/                     node:test regression suite
+Dockerfile / docker-compose.yml / .github/workflows/ci.yml   deployment + CI
 ```
 
 ## How a memory flows through Recall
@@ -134,12 +136,16 @@ downloaded and cached. After that, search is local and key-free.
 ## Configuration
 
 Copy `.env.example` to `.env` (never commit it) and adjust. Everything has a working
-default; the variables below are the full surface.
+default; the variables below are the full surface. Values are validated at startup: an
+explicitly-set invalid value (a bad port, a wildcard CORS origin, a non-numeric limit, a
+`HOST` containing a scheme or path) makes the process exit non-zero with a clear message
+rather than silently falling back.
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `PORT` | `6767` | HTTP port. |
 | `HOST` | `127.0.0.1` | Bind address. Loopback by default; set `0.0.0.0` only behind TLS/firewall with `AUTH_MODE=required`. |
+| `NODE_ENV` | *(unset)* | Set to `production` in production. Also makes `AUTH_MODE=dev` a startup error. |
 | `DATA_DIR` | `./data` | Base directory for the database. |
 | `STORAGE_BACKEND` | `sqlite` | `sqlite` (default) or `json` (legacy/rollback). |
 | `SQLITE_FILE` / `STORE_FILE` | `data/recall.db` / `data/store.json` | Explicit file paths. |
@@ -831,6 +837,10 @@ Product-oriented next steps, roughly in order:
 ## Status
 
 Functional and tested for the described scope: ingestion (raw text and `.txt`/`.md`/`.pdf`
-uploads), extraction, persistence, retrieval, authentication and tenant isolation. It is a
-focused engineering project, **not** a production-hardened, horizontally-scaled service — see
-[Limitations](#limitations) before exposing it.
+uploads), extraction, persistence, retrieval, authentication and tenant isolation. It is
+operationally ready for a **private, single-instance** deployment: liveness/readiness
+endpoints, draining-aware graceful shutdown, fail-fast configuration validation, a minimal
+non-root container, a smoke matrix and CI. Search reports how it actually ranked (`ranking`:
+`dense` | `lexical` | `none`) so a degraded fallback is never presented as semantic search.
+It is a focused engineering project, **not** a production-hardened, horizontally-scaled
+service — see [Limitations](#limitations) before exposing it.
