@@ -633,6 +633,14 @@ It checks liveness/readiness, authentication, ingest → search → profile, a f
 attribution and dedupe, deletion, and that a lexical provider is never reported as dense. It
 cleans up everything it creates and exits non-zero on the first failure.
 
+To exercise the supported configurations end to end (and prove the default bind is not
+reachable from a non-loopback address), run the matrix — it starts a real server per scenario:
+
+```bash
+npm run smoke:matrix              # sqlite/json, tfidf/dense/degraded, dev/authenticated
+SMOKE_SKIP_DENSE=1 npm run smoke:matrix   # skip the scenarios that load the local model
+```
+
 ### Runtime and platform
 
 - **Node ≥ 22.** Declared in `package.json` (`engines`) and pinned by `.nvmrc` (`22`); `.npmrc`

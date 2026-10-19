@@ -22,7 +22,8 @@
     "embeddings:reset": "node scripts/reset-embeddings.js",
     "storage:reconcile": "node scripts/reconcile-storage.js",
     "recall": "node scripts/recall-cli.js",
-    "smoke": "node scripts/smoke.js"
+    "smoke": "node scripts/smoke.js",
+    "smoke:matrix": "node scripts/smoke-matrix.js"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.3.1",
