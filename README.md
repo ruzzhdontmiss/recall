@@ -147,6 +147,10 @@ default; the variables below are the full surface.
 | `CORS_ORIGINS` | *(off)* | Explicit comma-separated allowlist. Never a wildcard. |
 | `EMBEDDINGS_PROVIDER` | `xenova` | `xenova` \| `openai` \| `gemini` \| `tfidf`. |
 | `EMBEDDINGS_MODEL` | provider default | Override the embedding model id. |
+| `EMBEDDINGS_DTYPE` | `q8` | Local precision. Changing it changes the vector space (stale vectors are re-embedded on access; run `npm run embeddings:reindex`). |
+| `EMBEDDINGS_CACHE_DIR` | *(inside `node_modules`)* | Durable model cache directory (survives `npm ci`). |
+| `EMBEDDINGS_LOCAL_MODEL_PATH` | *(unset)* | Load models from a local directory (offline installs). |
+| `EMBEDDINGS_OFFLINE` | `false` | Never fetch models from the network. |
 | `EXTRACTION_PROVIDER` | `auto` | `auto` \| `openai` \| `anthropic` \| `gemini` \| `regex`. |
 | `EXTRACTION_MODEL` | provider default | Override the extraction model id. |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY` | *(empty)* | Provider credentials. |
@@ -391,21 +395,79 @@ printed.
 - The JSON store is never removed automatically; delete it yourself only after you are
   satisfied the SQLite data is correct.
 
+### Embedding-space rollback
+
+Restoring the previous **code and dependencies** is *not* sufficient on its own. The previous
+embedding stack reused any non-empty stored vector, so once a reindex has written new-space
+vectors (the old and new local spaces have the same dimension), the restored stack would score
+those vectors against its own — silently mixing two spaces.
+
+To roll back the embedding stack safely, invalidate the stored vectors first so the restored
+stack regenerates them:
+
+```bash
+# 1. Stop the server.
+# 2. Preview what would be cleared (writes nothing):
+npm run embeddings:reset -- --dry-run
+
+# 3. Clear every stored vector and the recorded space identity:
+npm run embeddings:reset -- --apply
+
+# 4. Now restore the previous code and dependencies, then start.
+```
+
+`embeddings:reset` preserves all documents, memories and chunks (text, provenance and records)
+and clears only the vector fields plus the `embedding_space` bookkeeping. It works for both
+`STORAGE_BACKEND=sqlite` and `STORAGE_BACKEND=json`. Run it while the newer code is still
+checked out (before `git checkout` / `npm ci`), because the older checkout does not ship this
+command. After the reset, the restored stack re-embeds vectors lazily on access (the older
+stack has no bulk reindex command).
+
 ## Embeddings
 
 Set `EMBEDDINGS_PROVIDER` to choose how vectors are produced:
 
 | Value | What it uses | Keys |
 |---|---|---|
-| `xenova` (default) | `@xenova/transformers` + `Xenova/bge-base-en-v1.5` | none |
+| `xenova` (default) | `@huggingface/transformers` + `Xenova/bge-base-en-v1.5` (`q8`) | none |
 | `openai` | `text-embedding-3-small` | `OPENAI_API_KEY` |
 | `gemini` | `text-embedding-004` | `GEMINI_API_KEY` or `GOOGLE_API_KEY` |
 | `tfidf` | lexical TF-IDF (fallback path) | none |
 
 Optional: `EMBEDDINGS_MODEL` overrides the model id for the selected provider.
 
-If the local Xenova model fails to load and you have not opted into a cloud provider, search
-falls back to TF-IDF and the server logs that clearly.
+**Vector-space identity.** Every stored vector records the provider, model and precision that
+produced it. Before a stored vector is scored, it is checked against the current space; a vector
+from a different space is re-embedded first, so a single query never compares vectors from two
+spaces. For the local provider the identity also encodes the installed
+`@huggingface/transformers` and `onnxruntime-node` versions (for example
+`Xenova/bge-base-en-v1.5@q8~r2+tf4.3.1+ort1.30.0`), because a runtime bump can change the
+numbers for identical text — so a caret dependency upgrade is detected automatically rather than
+silently reusing old vectors. At startup the server compares the recorded space with the active
+one and warns when they differ, then re-embeds stale vectors lazily on access. A store that
+already holds vectors but records no space (a pre-Phase-A store, or one whose reindex never
+completed) is reported as a **legacy/unknown** space and the space is deliberately left
+unrecorded, so the warning keeps firing until a verified reindex records it; the space is only
+recorded automatically for a store that is genuinely empty of vectors, and only once a provider
+has actually loaded. For a controlled, whole-corpus pass (recommended after a precision change or
+a local-stack upgrade):
+
+```bash
+npm run embeddings:reindex            # dry run: report what would change
+npm run embeddings:reindex -- --apply # re-embed, then record the new space
+```
+
+If a stale vector cannot be re-embedded (provider error, or an empty/falsy response), that row is
+excluded from dense scoring rather than compared against a foreign vector; chunk search falls
+back to lexical ranking for the whole set. A failed reindex never records the space, so the next
+startup keeps warning until it is complete.
+
+**Hosted providers** (`openai`, `gemini`) record the configured model id only. If a provider
+changes its server-side model behaviour without changing the id, Recall cannot detect it and the
+space is treated as unchanged.
+
+If the local model fails to load and you have not opted into a cloud provider, search falls back
+to TF-IDF and the server logs that clearly.
 
 ```bash
 # faster iteration while developing (needs a key)
@@ -483,28 +545,25 @@ Recall is a single-node, self-hosted engine. Known limits, stated honestly:
 - **Local/offline trust model.** Authentication and tenant isolation are enforced, but the app
   is intended to run on a trusted host behind your own network controls. Serve it over TLS and
   keep it off the public internet unless you have deliberately reviewed the deployment.
-- **`npm audit` dependencies.** Five advisories (4 high, 1 critical) are reported, all
-  transitive through `@xenova/transformers@2.17.2` (the latest published `@xenova` release):
-  - `sharp@0.32.6` (high) — image codec (libvips/libheif/librsvg) issues. The text-only
-    embedding path never exercises `sharp`.
-  - `protobufjs@6.11.6` via `onnxruntime-web@1.14.0` → `onnx-proto@4.0.4` (critical) — protobuf
-    code-generation/DoS issues reachable when deserializing ONNX model protobufs. This app only
-    loads the trusted `Xenova/bge-base-en-v1.5` model; do not point `EMBEDDINGS_MODEL` at an
-    untrusted model.
+- **`npm audit` dependencies.** Clean: `npm audit` reports **0 vulnerabilities** against the
+  installed tree. Embeddings run on `@huggingface/transformers@4.3.1` (Apache-2.0), whose Node
+  runtime is `onnxruntime-node@1.30.0` + `onnxruntime-common@1.30.0` and `sharp@0.35.5`.
+  `onnxruntime-web@1.31.0-dev.<sha>` (a pinned prerelease) and its `protobufjs@7.6.6` are
+  installed as transitive dependencies but are **never executed on Node** — the Node build
+  imports `onnxruntime-node`/`onnxruntime-common`, not the web runtime — and they carry no
+  advisories. The previous `@xenova/transformers@2.17.2` tree (5 advisories: 4 high, 1 critical,
+  via `protobufjs@6` / `onnx-proto` / `sharp@0.32`) has been removed entirely.
 
-  There is **no non-breaking fix**: `npm audit fix --force` would downgrade
-  `@xenova/transformers` to `1.4.2` (older and worse) or requires overriding `protobufjs@6`
-  with `8.x` / `sharp` across a major version that `onnx-proto` and the native binaries do not
-  support. The clean path is to migrate embeddings to `@huggingface/transformers` (the
-  maintained successor, with newer `onnxruntime`/`sharp`). Until then these are documented, not
-  silently ignored.
+  Because the ONNX runtime changed (1.14.0 → 1.30.0), int8 inference numerics changed, so the
+  stored vector space changed. Existing vectors are **not** reused: they are detected as stale
+  and re-embedded (lazily on access, or in bulk with `npm run embeddings:reindex -- --apply`).
 
 ## Roadmap
 
 Product-oriented next steps, roughly in order:
 
-- **Migrate embeddings to `@huggingface/transformers`** — clears the transitive `npm audit`
-  advisories and tracks the maintained runtime.
+- **Migrate embeddings to `@huggingface/transformers`** — *done in Phase A*: clears the
+  transitive `npm audit` advisories and tracks the maintained runtime (see the note above).
 - **Indexed vector search** — move scoring out of memory (e.g. `sqlite-vec` or an external
   vector store) behind the existing `lib/storage` facade.
 - **File ingestion** — shipped for `.txt` / `.md` / `.pdf` (upload → extract → chunk → embed →

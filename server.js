@@ -135,6 +135,53 @@ function createApp(config = readConfig()) {
   // Remove any temp files left behind by a crash mid-upload.
   fileStore.sweepTemps();
 
+  // Embedding-space bookkeeping. Run AFTER warmup (see the listen callback) so it
+  // reflects the provider that actually loaded: if no provider is usable (the
+  // local provider failed over to lexical, or a hosted provider failed to
+  // initialize) we must not record a dense space. Per-row detection still
+  // prevents mixed scoring (foreign vectors are re-embedded before use); this is
+  // the operator-facing signal that a full offline reindex is due.
+  //
+  // The recorded space is only (re)written for a store that holds NO stored
+  // vectors. A store that already holds vectors but names no space (a pre-Phase-A
+  // store, or one whose reindex never completed) is reported as a legacy/unknown
+  // space and deliberately left unrecorded, so the warning keeps firing until a
+  // verified `embeddings:reindex -- --apply` records the space. This never
+  // overwrites existing evidence of an incomplete migration.
+  function checkEmbeddingSpace() {
+    try {
+      const currentSpace = embeddings.activeSpace();
+      const providerReady =
+        typeof embeddings.isInitialized === "function" ? embeddings.isInitialized() : true;
+      const recordedSpace = typeof db.getMeta === "function" ? db.getMeta("embedding_space") : null;
+      const hasVectors =
+        typeof db.hasStoredVectors === "function" ? db.hasStoredVectors() : false;
+
+      if (hasVectors && recordedSpace && recordedSpace !== currentSpace) {
+        console.warn(
+          `[embeddings] stored vectors are from a different space (recorded=${recordedSpace}, ` +
+            `current=${currentSpace}); run "npm run embeddings:reindex" (dry-run) then ` +
+            `"npm run embeddings:reindex -- --apply" to re-embed the whole corpus.`
+        );
+      } else if (hasVectors && !recordedSpace) {
+        console.warn(
+          `[embeddings] stored vectors exist but no embedding space is recorded; treating them ` +
+            `as a legacy/unknown space. Run "npm run embeddings:reindex" (dry-run) then ` +
+            `"npm run embeddings:reindex -- --apply" to verify and record the space.`
+        );
+      } else if (!hasVectors && providerReady && recordedSpace !== currentSpace) {
+        // A genuinely empty store: (re)record the current space so a later change
+        // is detected. Skipped when no provider is available — there is nothing
+        // meaningful to record yet, and recording the configured (unloaded)
+        // provider would be misleading.
+        if (typeof db.setMeta === "function") db.setMeta("embedding_space", currentSpace);
+      }
+    } catch (err) {
+      console.warn(`[embeddings] space check failed: ${err.message}`);
+    }
+  }
+  app.checkEmbeddingSpace = checkEmbeddingSpace;
+
   app.use("/v1", ipLimiter, auth, generalLimiter);
 
   // Resolve and authorize the request's container against the authenticated
@@ -511,9 +558,10 @@ function attachShutdown(server, { timeoutMs = 10000 } = {}) {
 }
 
 if (require.main === module) {
-  const server = app.listen(PORT, () => {
+  const server = app.listen(PORT, async () => {
     console.log(`Recall running at http://localhost:${PORT}`);
-    embeddings.warmup();
+    await embeddings.warmup();
+    app.checkEmbeddingSpace();
   });
   const shutdown = attachShutdown(server);
   process.on("SIGTERM", () => shutdown("SIGTERM"));
