@@ -1,0 +1,73 @@
+# Private, single-instance deployment.
+#
+#   cp .env.example .env      # adjust; never commit .env
+#   docker compose up --build
+#
+# Security posture:
+#  * The published port is bound to loopback only. To expose the service, put an
+#    authenticated, TLS-enabled reverse proxy in front — do NOT change this to
+#    0.0.0.0 on a host that is reachable from the internet.
+#  * AUTH_MODE=required is enforced (the server refuses AUTH_MODE=dev under
+#    NODE_ENV=production).
+#  * Secrets come from the environment. Compose reads `.env` in this directory for
+#    ${VAR} substitution; in real deployments inject them from your secret
+#    manager instead of a file.
+#  * Do not scale this service past one replica: correctness depends on
+#    in-process state (see the README "Limitations").
+#
+# State:
+#  * recall-data  — SQLite database and uploaded files (back this up).
+#  * recall-cache — the local embedding model cache (safe to regenerate).
+services:
+  recall:
+    build: .
+    image: recall:0.1.0
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6767:6767"
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0 # inside the container; the loopback port binding is the boundary
+      PORT: "6767"
+      AUTH_MODE: required
+      DEV_TENANT: ${DEV_TENANT:-dev}
+      DEV_CONTAINER: ${DEV_CONTAINER:-dev}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-sqlite}
+      RATE_LIMIT_PER_MIN: ${RATE_LIMIT_PER_MIN:-120}
+      RATE_LIMIT_EXPENSIVE_PER_MIN: ${RATE_LIMIT_EXPENSIVE_PER_MIN:-30}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      EMBEDDINGS_PROVIDER: ${EMBEDDINGS_PROVIDER:-xenova}
+      EMBEDDINGS_MODEL: ${EMBEDDINGS_MODEL:-}
+      EMBEDDINGS_DTYPE: ${EMBEDDINGS_DTYPE:-q8}
+      EMBEDDINGS_OFFLINE: ${EMBEDDINGS_OFFLINE:-false}
+      EXTRACTION_PROVIDER: ${EXTRACTION_PROVIDER:-auto}
+      EXTRACTION_MODEL: ${EXTRACTION_MODEL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-10485760}
+      MAX_PDF_PAGES: ${MAX_PDF_PAGES:-500}
+      PDF_EXTRACT_TIMEOUT_MS: ${PDF_EXTRACT_TIMEOUT_MS:-20000}
+      PDF_MAX_CONCURRENT: ${PDF_MAX_CONCURRENT:-2}
+      PDF_MAX_QUEUE: ${PDF_MAX_QUEUE:-64}
+    volumes:
+      - recall-data:/app/data
+      - recall-cache:/app/.cache/transformers
+    # Bound the container so a runaway upload cannot exhaust the host.
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2.0"
+    healthcheck:
+      test: ["CMD", "node", "scripts/healthcheck.js"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    stop_grace_period: 15s
+
+volumes:
+  recall-data:
+  recall-cache:

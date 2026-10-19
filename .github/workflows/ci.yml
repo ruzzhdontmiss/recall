@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22 is the engine floor (see package.json); 24 proves forward compatibility.
+        node: ["22", "24"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Install (lockfile-exact)
+        run: npm ci
+      - name: Dependency audit
+        run: npm audit --audit-level=high
+      - name: Unit + integration tests
+        run: npm test
+      - name: Evaluations
+        run: |
+          npm run eval:extract
+          npm run eval:documents
+          npm run eval:search
+      - name: Startup and health check
+        run: |
+          set -euo pipefail
+          # The health endpoints are unauthenticated, so no key is needed here.
+          DATA_DIR="$(mktemp -d)"
+          EMBEDDINGS_PROVIDER=tfidf EXTRACTION_PROVIDER=regex PORT=6799 \
+            DATA_DIR="$DATA_DIR" node server.js &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:6799/readyz >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:6799/healthz
+          curl -fsS http://127.0.0.1:6799/readyz
+          kill "$server_pid"
+
+  container:
+    name: container build + run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t recall:ci .
+      - name: Run and probe on the target platform
+        run: |
+          set -euo pipefail
+          # No key is needed: /healthz and /readyz are unauthenticated. AUTH_MODE
+          # stays at the image default (required) because the image sets
+          # NODE_ENV=production, which refuses AUTH_MODE=dev.
+          docker run -d --name recall-ci -p 127.0.0.1:6767:6767 \
+            -e EMBEDDINGS_PROVIDER=tfidf \
+            -e EXTRACTION_PROVIDER=regex \
+            recall:ci
+          ready=0
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:6767/readyz >/dev/null 2>&1; then ready=1; break; fi
+            sleep 2
+          done
+          docker logs recall-ci || true
+          test "$ready" = "1" || { echo "container did not become ready"; exit 1; }
+          curl -fsS http://127.0.0.1:6767/healthz
+          # SIGTERM must exit cleanly (tini forwards it to Node).
+          docker stop --time 15 recall-ci
+          code=$(docker inspect -f '{{.State.ExitCode}}' recall-ci)
+          test "$code" = "0" || { echo "unclean exit: $code"; exit 1; }
+          docker rm recall-ci
+
+      - name: Verify local ONNX model loads on Linux
+        run: |
+          set -euo pipefail
+          # The default provider runs the native ONNX runtime. Prove it loads (and
+          # the model downloads and caches) inside the Linux image, and that
+          # ranking is genuinely dense — not a silent lexical fallback.
+          docker run -d --name recall-onnx -p 127.0.0.1:6768:6767 -e EXTRACTION_PROVIDER=regex recall:ci
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:6768/readyz >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          docker exec recall-onnx node scripts/eval-search.js
+          docker exec recall-onnx node -e "fetch('http://127.0.0.1:6767/readyz').then(r=>r.json()).then(b=>{console.log(JSON.stringify(b.dependencies.embeddings)); if(!b.dependencies.embeddings.dense) process.exit(1);})"
+          docker stop --time 15 recall-onnx
+          docker rm recall-onnx

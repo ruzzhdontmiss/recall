@@ -21,7 +21,8 @@
     "embeddings:reindex": "node scripts/backfill-embeddings.js",
     "embeddings:reset": "node scripts/reset-embeddings.js",
     "storage:reconcile": "node scripts/reconcile-storage.js",
-    "recall": "node scripts/recall-cli.js"
+    "recall": "node scripts/recall-cli.js",
+    "smoke": "node scripts/smoke.js"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.3.1",

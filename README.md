@@ -617,6 +617,22 @@ Tests use Node's built-in runner with temporary directories and never touch the 
 They run with `EMBEDDINGS_PROVIDER=tfidf` and `EXTRACTION_PROVIDER=regex` for speed and
 determinism; live model/LLM paths are exercised separately by the eval scripts.
 
+### Smoke test against a running instance
+
+The suite above drives the app in-process. To check a *deployed* instance — a local
+`npm start` or the container — run the smoke test against its URL:
+
+```bash
+# dev-mode instance (no key needed)
+RECALL_URL=http://127.0.0.1:6767 npm run smoke
+# authenticated instance
+RECALL_URL=http://127.0.0.1:6767 RECALL_KEY=sm_… npm run smoke
+```
+
+It checks liveness/readiness, authentication, ingest → search → profile, a file upload with
+attribution and dedupe, deletion, and that a lexical provider is never reported as dense. It
+cleans up everything it creates and exits non-zero on the first failure.
+
 ### Runtime and platform
 
 - **Node ≥ 22.** Declared in `package.json` (`engines`) and pinned by `.nvmrc` (`22`); `.npmrc`
@@ -651,6 +667,108 @@ known ids and forged container tags, hashing at rest, log redaction, rate limits
 validation, the dev-mode production guard, the CLI bootstrap/revocation workflow and data
 isolation after reopening the database. `test/auth-race.test.js` and a data-layer test cover
 the container-claim race (see [Limitations](#limitations)).
+
+## Operations and deployment
+
+Recall is designed for a **private, single-instance** deployment. It ships a minimal
+production container plus the pieces an operator needs to run it safely.
+
+### Health and readiness
+
+Two unauthenticated endpoints (a probe cannot hold an API key) expose coarse,
+non-secret status only — never paths, content or tenants:
+
+```bash
+curl localhost:6767/healthz   # liveness: 200 while the process serves HTTP
+curl localhost:6767/readyz    # readiness: 200 when serviceable, 503 otherwise
+```
+
+`/readyz` reports each dependency and answers `503` while **draining** or when the
+**database or upload storage is unusable**. Embeddings are reported but are
+deliberately *not* a readiness gate: an unavailable provider degrades to lexical
+search, which still serves requests, so it must not restart-loop an otherwise
+healthy instance. A dense provider that failed to load shows up as `"degraded"`:
+
+```json
+{"status":"degraded","ready":true,"degraded":true,"draining":false,"version":"0.1.0",
+ "dependencies":{"database":{"ok":true,"backend":"sqlite"},"storage":{"ok":true},
+ "embeddings":{"ok":true,"provider":"uninitialized","configured":"openai","dense":false,
+ "space":"uninitialized"}}}
+```
+
+### Graceful shutdown
+
+On `SIGTERM`/`SIGINT` Recall flips `/readyz` to not-ready first (so a probe-driven
+router drains), stops accepting connections, terminates any in-flight PDF workers,
+sweeps temp files, closes the database, and exits `0`. A hard 10-second timeout
+guarantees the process can never hang. Run it under an init system or a container
+init (`tini`, as in the image) so signals are delivered and zombies reaped.
+
+### Container
+
+```bash
+docker build -t recall:0.1.0 .
+cp .env.example .env      # adjust; never commit it
+docker compose up --build
+```
+
+After it is up, confirm it end to end from the host: `RECALL_KEY=sm_… npm run smoke` (or open
+the dashboard at `http://127.0.0.1:6767/`).
+
+The image is `node:22` Debian slim, runs as the unprivileged `node` user, copies
+only runtime files, and installs production dependencies from the lockfile. The
+compose file publishes the port on **loopback only** and enforces
+`AUTH_MODE=required`. To expose the service, put an authenticated, TLS-enabled
+reverse proxy in front; never publish it directly.
+
+Two volumes hold state:
+
+| Volume | Mount | Contents | Backed up |
+|---|---|---|---|
+| `recall-data` | `/app/data` | SQLite database, `uploads/` | **Yes — required** |
+| `recall-cache` | `/app/.cache/transformers` | local embedding model | No (regenerates) |
+
+Set resource limits (the compose file sets memory/CPU caps) and watch disk usage on
+`recall-data`: the database grows with content and uploads are not evicted
+automatically. A full or read-only disk surfaces as `503` from `/readyz` (the
+storage probe fails) rather than as silent corruption.
+
+**Do not run more than one replica.** Correctness depends on in-process state (see
+[Limitations](#limitations)): the SQLite backend keeps an in-memory mirror and the
+rate limiter is per-process.
+
+### Backup and restore
+
+Back up the database and the upload directory together — they must be consistent as
+a set. The model cache is optional (it regenerates).
+
+```bash
+# with the service stopped
+tar czf "recall-backup-$(date +%F).tgz" -C /app data
+```
+
+Restore by extracting over `DATA_DIR` with the service stopped. The SQLite store is
+a single `recall.db` in WAL mode; a snapshot taken while the service runs must
+include `recall.db-wal`/`-shm`, or stop the service first. `npm run db:migrate-json`
+migrates a legacy JSON store, and `npm run storage:reconcile` reports files not
+referenced by any record (dry-run by default).
+
+### Logs
+
+Logs are single-line JSON events plus a few human-readable `[...]` lifecycle lines.
+They never contain API keys, request bodies, document content, or absolute storage
+paths: startup logs the database **basename** only, and request failures log only
+the method, path, status and error class.
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on Node 22 and 24 — lockfile install,
+`npm audit --audit-level=high`, the full test suite, all three evaluation suites, a
+real startup plus `/healthz`/`/readyz` check, and a container build that runs the
+image and verifies a clean `SIGTERM` exit.
+
+Public deployment is a separate, explicit decision; this section covers a private
+instance only.
 
 ## Limitations
 

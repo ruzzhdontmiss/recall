@@ -26,38 +26,18 @@ const { ingestUpload } = require("./lib/documents/ingest");
 const fileStore = require("./lib/documents/storage");
 const { shutdownPdfWorkers } = require("./lib/documents/pdf");
 const { readConfig: readDocConfig } = require("./lib/documents/config");
-
-const PORT = process.env.PORT || 6767;
-
-function toPosInt(value, fallback) {
-  const n = Number.parseInt(value, 10);
-  return Number.isFinite(n) && n > 0 ? n : fallback;
-}
-
 // Configuration is read per createApp() call so tests can build isolated apps
-// with different auth/limit settings.
-function readConfig(env = process.env) {
-  const authMode = (env.AUTH_MODE || "required").toLowerCase().trim();
-  if (authMode !== "required" && authMode !== "dev") {
-    throw new Error(`unknown AUTH_MODE=${authMode} (expected "required" or "dev")`);
+// with different auth/limit settings. Validation lives in lib/config.js.
+const { readServerConfig: readConfig } = require("./lib/config");
+
+const VERSION = pkgVersion();
+
+function pkgVersion() {
+  try {
+    return require("./package.json").version || "0.0.0";
+  } catch {
+    return "0.0.0";
   }
-  if (authMode === "dev" && env.NODE_ENV === "production") {
-    throw new Error("AUTH_MODE=dev is not allowed when NODE_ENV=production");
-  }
-  return {
-    authMode,
-    // Bind to loopback by default so a fresh install is never reachable from
-    // another machine until the operator explicitly opts in (HOST=0.0.0.0).
-    host: env.HOST && env.HOST.trim() ? env.HOST.trim() : "127.0.0.1",
-    devTenant: env.DEV_TENANT || "dev",
-    devContainer: env.DEV_CONTAINER || "dev",
-    generalMax: toPosInt(env.RATE_LIMIT_PER_MIN, 120),
-    expensiveMax: toPosInt(env.RATE_LIMIT_EXPENSIVE_PER_MIN, 30),
-    corsOrigins: String(env.CORS_ORIGINS || "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean),
-  };
 }
 
 // The dashboard loads its fonts from Google Fonts; everything else is same-origin.
@@ -122,6 +102,78 @@ function createApp(config = readConfig()) {
 
   app.use(express.json({ limit: "2mb" }));
   app.use(express.static(path.join(__dirname, "public")));
+
+  // ---------------------------------------------------------- health --------
+  // Liveness and readiness for orchestrators. Both are unauthenticated (a probe
+  // cannot hold a key) and expose only coarse, non-secret detail — versions,
+  // booleans, provider names and error codes, never paths, content or tenants.
+  let draining = false;
+  // Called on shutdown so a load balancer stops routing here before we exit.
+  app.beginDraining = () => {
+    draining = true;
+  };
+
+  // Liveness: the process is up and serving HTTP. Deliberately does not touch any
+  // dependency, so a transient outage cannot trigger a restart loop.
+  app.get("/healthz", (req, res) => {
+    res.json({
+      status: "ok",
+      service: "recall",
+      version: VERSION,
+      uptimeSeconds: Math.round(process.uptime()),
+    });
+  });
+
+  // Readiness: whether this instance can serve requests, with per-dependency
+  // detail. 503 while draining or when a hard dependency is unusable.
+  app.get("/readyz", (req, res) => {
+    const report = readinessReport();
+    res.status(report.ready ? 200 : 503).json(report);
+  });
+
+  function readinessReport() {
+    const dependencies = {};
+
+    try {
+      db.ping();
+      dependencies.database = { ok: true, backend: db.backend };
+    } catch (err) {
+      dependencies.database = { ok: false, code: (err && err.code) || "EUNKNOWN" };
+    }
+
+    const storage = fileStore.probe();
+    dependencies.storage = storage.ok ? { ok: true } : { ok: false, code: storage.code };
+
+    // Embeddings are advisory: a lexical fallback still serves search, so an
+    // unusable provider must not make the instance unready (that would
+    // restart-loop a healthy service during a provider outage). It is reported
+    // so an operator can still see the degradation.
+    let provider = "uninitialized";
+    let configured = "uninitialized";
+    let dense = false;
+    let space = "uninitialized";
+    try {
+      provider = embeddings.getProviderName();
+      configured = embeddings.describe().provider;
+      dense = embeddings.isDense();
+      space = embeddings.activeSpace();
+    } catch {
+      /* keep the conservative defaults */
+    }
+    dependencies.embeddings = { ok: true, provider, configured, dense, space };
+
+    const ready = !draining && dependencies.database.ok && dependencies.storage.ok;
+    // "degraded" = a dense provider was requested but search is running lexically.
+    const degraded = configured !== "tfidf" && !dense;
+    return {
+      status: !ready ? "unavailable" : degraded ? "degraded" : "ready",
+      ready,
+      degraded,
+      draining,
+      version: VERSION,
+      dependencies,
+    };
+  }
 
   // ----------------------------------------------------------- auth ------
   if (config.authMode === "dev") {
@@ -583,16 +635,36 @@ function createApp(config = readConfig()) {
   return app;
 }
 
-const app = createApp();
+// Build the app. A misconfigured environment must produce a clear, single-line
+// diagnostic and a non-zero exit instead of an unhandled exception when the
+// process is started directly; a library/test require still throws as before.
+let app;
+try {
+  app = createApp();
+} catch (err) {
+  if (require.main === module) {
+    console.error(`[server] startup failed: ${(err && err.message) || err}`);
+    process.exit(1);
+  }
+  throw err;
+}
 
 // Graceful shutdown: stop accepting connections, close the database, then exit.
 // Guarded against duplicate execution and a hard timeout so it can never hang.
-function attachShutdown(server, { timeoutMs = 10000 } = {}) {
+function attachShutdown(server, { timeoutMs = 10000, onDrain } = {}) {
   let closing = false;
   return function shutdown(signal) {
     if (closing) return;
     closing = true;
     console.log(`[server] ${signal} received — shutting down`);
+    // Mark not-ready first, so a probe-driven router drains before we close.
+    if (typeof onDrain === "function") {
+      try {
+        onDrain();
+      } catch {
+        /* draining is best-effort */
+      }
+    }
     // Terminate in-flight PDF workers first so any pending upload fails fast
     // instead of holding the socket open until the deadline.
     try {
@@ -629,8 +701,8 @@ function attachShutdown(server, { timeoutMs = 10000 } = {}) {
 
 if (require.main === module) {
   const config = readConfig();
-  const server = app.listen(PORT, config.host, async () => {
-    console.log(`Recall running at http://${config.host}:${PORT}`);
+  const server = app.listen(config.port, config.host, async () => {
+    console.log(`Recall running at http://${config.host}:${config.port}`);
     const loopback = ["127.0.0.1", "::1", "localhost"].includes(config.host);
     if (!loopback) {
       console.warn(
@@ -641,7 +713,7 @@ if (require.main === module) {
     await embeddings.warmup();
     app.checkEmbeddingSpace();
   });
-  const shutdown = attachShutdown(server);
+  const shutdown = attachShutdown(server, { onDrain: () => app.beginDraining() });
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
 }
