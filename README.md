@@ -181,6 +181,38 @@ npm run key:create -- --tenant alice --container demo_user --name "alice laptop"
 #   e.g. if your old tags were user_123 / demo_user, create keys with those --container values.
 ```
 
+### Command-line client
+
+`npm run recall` is a small client for a **running** server (local or private remote). It uses
+`RECALL_URL` (default `http://127.0.0.1:6767`) and `RECALL_API_KEY`, or `--url` / `--key`:
+
+```bash
+export RECALL_URL=http://127.0.0.1:6767
+export RECALL_API_KEY=sm_…
+
+npm run recall -- whoami
+npm run recall -- add "I'm a backend engineer in Berlin."
+npm run recall -- search "where does this person work" --mode hybrid
+npm run recall -- memories
+npm run recall -- upload ./notes.pdf
+npm run recall -- documents
+npm run recall -- document <id>        # status, filename and source passages
+npm run recall -- delete <id> --yes    # destructive: --yes is required
+npm run recall -- forget <memoryId> --yes
+```
+
+Every command accepts `--container <tag>` (default: the key's container) and `--json`. A failed
+operation — invalid input, an HTTP error, or a **failed ingestion** — exits non-zero;
+destructive commands without `--yes` exit `2` and change nothing.
+
+### Browser dashboard
+
+Serving `/` (the private, same-origin dashboard) lets you add memories, search, inspect the
+profile, list/forget memories and click any document to see its source passages. Enter your API
+key in the header (kept only in this browser's `localStorage`); the dashboard talks exclusively
+to the public `/v1` API, so embedding vectors, provider/model bookkeeping and server-side paths
+never reach the browser.
+
 ## Authentication and multi-tenancy
 
 All `/v1` endpoints require a bearer API key:

@@ -32,6 +32,7 @@
 
     <!-- LEFT: profile -->
     <aside class="profile-pane">
+      <div id="banner" class="banner" hidden></div>
       <h2 class="pane-title">who this is</h2>
       <p class="pane-sub">durable facts, kept until something contradicts them</p>
       <ul id="staticList" class="fact-list fact-list--static"></ul>
@@ -70,9 +71,17 @@
         <ul id="searchResults" class="result-list"></ul>
       </div>
 
+      <div class="card memories-card">
+        <h2 class="pane-title">memories</h2>
+        <p class="pane-sub">everything stored in this space — inspect or forget</p>
+        <ul id="memoryList" class="result-list"></ul>
+      </div>
+
       <div class="card feed-card">
-        <h2 class="pane-title">recent captures</h2>
+        <h2 class="pane-title">documents</h2>
+        <p class="pane-sub">notes and uploads — click one to see its source passages</p>
         <ul id="docFeed" class="doc-feed"></ul>
+        <div id="docDetail" class="doc-detail" hidden></div>
       </div>
 
     </section>
