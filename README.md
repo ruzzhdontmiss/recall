@@ -135,11 +135,14 @@ downloaded and cached. After that, search is local and key-free.
 
 ## Configuration
 
-Copy `.env.example` to `.env` (never commit it) and adjust. Everything has a working
-default; the variables below are the full surface. Values are validated at startup: an
-explicitly-set invalid value (a bad port, a wildcard CORS origin, a non-numeric limit, a
-`HOST` containing a scheme or path) makes the process exit non-zero with a clear message
-rather than silently falling back.
+Configuration is read from the **process environment**. For a direct install, export the
+variables, or start with `node --env-file=.env server.js` (Node 22.9+) — `npm start` does
+not read `.env` by itself. `docker compose` **does** read `.env`; copy `.env.example` to
+`.env` (never commit it) and adjust. Everything has a working default; the variables below
+are the full surface. Values are validated at startup: an explicitly-set invalid value (a
+bad port, a wildcard CORS origin, a non-numeric limit, a `HOST` containing a scheme or
+path) makes the process exit non-zero with a clear message rather than silently falling
+back.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -205,7 +208,7 @@ npm run recall -- upload ./notes.pdf
 npm run recall -- documents
 npm run recall -- document <id>        # status, filename and source passages
 npm run recall -- delete <id> --yes    # destructive: --yes is required
-npm run recall -- forget <memoryId> --yes
+npm run recall -- forget <memoryId> --yes   # hides the fact; the source document is kept
 ```
 
 Every command accepts `--container <tag>` (default: the key's container) and `--json`. A failed
@@ -215,10 +218,12 @@ destructive commands without `--yes` exit `2` and change nothing.
 ### Browser dashboard
 
 Serving `/` (the private, same-origin dashboard) lets you add memories, search, inspect the
-profile, list/forget memories and click any document to see its source passages. Enter your API
-key in the header (kept only in this browser's `localStorage`); the dashboard talks exclusively
-to the public `/v1` API, so embedding vectors, provider/model bookkeeping and server-side paths
-never reach the browser.
+profile, list/forget memories and click any document to see its source passages. Forgetting a
+memory hides that extracted fact from the profile and from `searchMode=memories`, but keeps the
+source note (so you can still inspect where it came from); delete the source document to remove
+the content itself. Enter your API key in the header (kept only in this browser's
+`localStorage`); the dashboard talks exclusively to the public `/v1` API, so embedding vectors,
+provider/model bookkeeping and server-side paths never reach the browser.
 
 ## Authentication and multi-tenancy
 
@@ -298,8 +303,9 @@ Defence-in-depth that is always on:
 
 - **Every `/v1` route requires a bearer key**; the dashboard page itself holds no data and no
   secrets (it prompts for a key, kept only in the browser's `localStorage`).
-- **Strict browser headers** on every response: a self-only `Content-Security-Policy`,
-  `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
+- **Strict browser headers** on every response: a self-only `Content-Security-Policy` (the
+  dashboard ships no third-party fonts, scripts or CDNs), `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
   `Cross-Origin-Opener-Policy`/`-Resource-Policy: same-origin`, and a locked-down
   `Permissions-Policy`. `X-Powered-By` is disabled.
 - **CSRF does not apply**: authentication is a bearer token in a header (no cookies, no ambient
@@ -617,7 +623,13 @@ npm test                      # storage, migration, API, auth/isolation, documen
 npm run eval:search           # paraphrase retrieval check (downloads the local model on first run)
 npm run eval:extract          # regex-gap + structured-schema check (live LLM skipped without a key)
 npm run eval:documents        # end-to-end txt/md/pdf ingestion, attribution, dedupe, scoping, delete
+npm run eval:memory           # 44-question retrieval set: top-1, Recall@5, stale/conflict, provenance
 ```
+
+`eval:memory` ingests synthetic facts and a multi-chunk document through the real HTTP API,
+then measures retrieval. `--strict` enforces the fixture thresholds and fails on stale hits
+(CI runs it this way). It also probes questions with no answer, reports the response's real
+`ranking` mode, and verifies that deleting a document removes its chunks and stored file.
 
 Tests use Node's built-in runner with temporary directories and never touch the real store.
 They run with `EMBEDDINGS_PROVIDER=tfidf` and `EXTRACTION_PROVIDER=regex` for speed and
@@ -787,7 +799,7 @@ the method, path, status and error class.
 ### Continuous integration
 
 `.github/workflows/ci.yml` runs on Node 22 and 24 — lockfile install,
-`npm audit --audit-level=high`, the full test suite, all three evaluation suites, a
+`npm audit --audit-level=high`, the full test suite, all four evaluation suites, a
 real startup plus `/healthz`/`/readyz` check, and a container build that runs the
 image and verifies a clean `SIGTERM` exit.
 
@@ -806,6 +818,18 @@ Recall is a single-node, self-hosted engine. Known limits, stated honestly:
 - **Rate limiting is in-memory and per-process**, not distributed.
 - **Brute-force vector scoring.** Search ranks vectors in memory rather than using an indexed
   vector store; fine for this scale, not for millions of rows.
+- **Retrieval quality is model-bound.** On the deterministic 44-question evaluation (38
+  answerable; `npm run eval:memory`), the local `bge-base-en-v1.5` provider scores **84.2% top-1** and
+  **94.7% Recall@5**; the lexical fallback scores **73.7% / 81.6%**. Some paraphrases (for
+  example "Where is the user based?" for a stored "I now live in Lisbon.") rank outside the
+  top 5. Search returns scored candidates and does **not** apply a relevance cutoff, so a
+  client that needs "no answer" behavior should threshold on `score`. Closing these misses
+  needs a stronger reranker or hybrid scoring, not a formatting change.
+- **Contradiction resolution is slot-based.** Location, employer, role, editor, language
+  preference and "my favorite &lt;thing&gt;" are superseded when a newer value arrives; the old
+  row is retained with status `superseded` (visible in `/v1/memories`) but excluded from search
+  and the profile. Free-form notes that disagree with each other are not reconciled
+  automatically — both remain active.
 - **Document ingestion is synchronous and local-disk based.** Uploads are processed inline (no
   queue). PDF parsing is isolated in worker threads whose concurrency and queue are bounded
   (`PDF_MAX_CONCURRENT` / `PDF_MAX_QUEUE`), and each job is terminated once it exceeds
@@ -850,7 +874,9 @@ Functional and tested for the described scope: ingestion (raw text and `.txt`/`.
 uploads), extraction, persistence, retrieval, authentication and tenant isolation. It is
 operationally ready for a **private, single-instance** deployment: liveness/readiness
 endpoints, draining-aware graceful shutdown, fail-fast configuration validation, a minimal
-non-root container, a smoke matrix and CI. Search reports how it actually ranked (`ranking`:
-`dense` | `lexical` | `none`) so a degraded fallback is never presented as semantic search.
-It is a focused engineering project, **not** a production-hardened, horizontally-scaled
+non-root container, a smoke matrix and CI. Realistic memory workflows (updates, conflicts,
+document provenance, deletion, restart persistence, provider failure) and a deterministic
+44-question retrieval evaluation are part of the suite. Search reports how it actually ranked
+(`ranking`: `dense` | `lexical` | `none`) so a degraded fallback is never presented as semantic
+search. It is a focused engineering project, **not** a production-hardened, horizontally-scaled
 service — see [Limitations](#limitations) before exposing it.
