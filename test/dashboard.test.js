@@ -66,6 +66,24 @@ test("the dashboard and its assets are served", async () => {
   }
 });
 
+test("the dashboard loads only same-origin resources", async () => {
+  // A private, self-hosted instance must not phone home when the dashboard is
+  // opened. Fonts/CDNs are the usual offender, so both the markup and the CSP
+  // are checked for third-party origins.
+  const page = await fetch(base + "/");
+  const html = await page.text();
+  const csp = page.headers.get("content-security-policy");
+  assert.ok(csp, "the dashboard must send a CSP");
+  assert.ok(!/https?:\/\//.test(csp), `CSP must not allow third-party origins: ${csp}`);
+  assert.ok(!/<link[^>]+href="https?:\/\//i.test(html), "no external stylesheet/preconnect");
+  assert.ok(!/<script[^>]+src="https?:\/\//i.test(html), "no external script");
+  assert.ok(!/fonts\.googleapis|fonts\.gstatic|cdn\./i.test(html), "no font/CDN references");
+
+  const css = await (await fetch(base + "/style.css")).text();
+  assert.ok(!/@import\s+url\(\s*["']?https?:/i.test(css), "no external CSS imports");
+  assert.ok(!/url\(\s*["']?https?:/i.test(css), "no external CSS resources");
+});
+
 test("every element id app.js looks up exists in the page", async () => {
   const html = await (await fetch(base + "/")).text();
   const js = await (await fetch(base + "/app.js")).text();

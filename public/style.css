@@ -9,9 +9,10 @@
   --dynamic: #b06a1e;
   --dynamic-bg: #f4e9d8;
   --accent: #b8452f;
-  --serif: "Source Serif 4", Georgia, serif;
-  --sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, sans-serif;
-  --mono: "IBM Plex Mono", ui-monospace, monospace;
+  /* System font stacks only: the dashboard never contacts a third party. */
+  --serif: ui-serif, Georgia, "Times New Roman", serif;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   --radius: 3px;
 }
 

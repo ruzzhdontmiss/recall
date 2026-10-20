@@ -143,7 +143,15 @@ async function refreshMemories() {
 }
 
 async function forgetMemory(id) {
-  if (!window.confirm("Forget this memory? This cannot be undone.")) return;
+  if (
+    !window.confirm(
+      "Forget this extracted memory? It will disappear from the profile and memory search. " +
+        "The original note you added is kept as its source and stays searchable — delete the " +
+        "source document to remove it entirely."
+    )
+  ) {
+    return;
+  }
   try {
     await api(`/v1/memories/${encodeURIComponent(id)}${containerParam()}`, { method: "DELETE" });
     await refreshAll();
