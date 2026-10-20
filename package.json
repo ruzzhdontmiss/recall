@@ -18,6 +18,7 @@
     "eval:search": "node scripts/eval-search.js",
     "eval:extract": "node scripts/eval-extract.js",
     "eval:documents": "node scripts/eval-documents.js",
+    "eval:memory": "node scripts/eval-memory.js",
     "embeddings:reindex": "node scripts/backfill-embeddings.js",
     "embeddings:reset": "node scripts/reset-embeddings.js",
     "storage:reconcile": "node scripts/reconcile-storage.js",

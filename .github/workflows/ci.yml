@@ -31,6 +31,7 @@ jobs:
           npm run eval:extract
           npm run eval:documents
           npm run eval:search
+          npm run eval:memory -- --strict
       - name: Private smoke matrix
         run: npm run smoke:matrix
       - name: Startup and health check

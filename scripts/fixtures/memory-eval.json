@@ -1,0 +1,546 @@
+{
+  "name": "recall-memory-eval",
+  "version": 1,
+  "containerTag": "eval_memory",
+  "description": "Deterministic, API-driven retrieval evaluation over synthetic personal facts and one multi-chunk document. No live model APIs are required; the local ONNX provider or TF-IDF is used.",
+  "facts": [
+    {
+      "id": "employer_old",
+      "content": "I work at Acme Corp."
+    },
+    {
+      "id": "role_old",
+      "content": "I'm a backend engineer."
+    },
+    {
+      "id": "location_old",
+      "content": "I live in Berlin."
+    },
+    {
+      "id": "language_old",
+      "content": "I prefer Rust over Go."
+    },
+    {
+      "id": "editor",
+      "content": "I use Neovim as my editor."
+    },
+    {
+      "id": "employer_new",
+      "content": "I now work at Globex Inc."
+    },
+    {
+      "id": "location_new",
+      "content": "I now live in Lisbon."
+    },
+    {
+      "id": "role_new",
+      "content": "I'm a staff engineer now."
+    },
+    {
+      "id": "language_new",
+      "content": "I prefer Python over JavaScript."
+    },
+    {
+      "id": "atlas_db",
+      "content": "Project Atlas uses PostgreSQL for its primary datastore."
+    },
+    {
+      "id": "apollo_db",
+      "content": "Project Apollo uses MongoDB for its primary datastore."
+    },
+    {
+      "id": "atlas_owner",
+      "content": "Project Atlas is owned by the payments team."
+    },
+    {
+      "id": "apollo_owner",
+      "content": "Project Apollo is owned by the growth team."
+    },
+    {
+      "id": "current_work",
+      "content": "I'm working on the billing migration this week."
+    },
+    {
+      "id": "db_pref_old",
+      "content": "My favorite database is PostgreSQL."
+    },
+    {
+      "id": "db_pref_new",
+      "content": "My favorite database is SQLite."
+    }
+  ],
+  "documents": [
+    {
+      "id": "deployment_notes",
+      "filename": "deployment-notes.md",
+      "mediaType": "text/markdown",
+      "content": "# Recall deployment handbook\n\n## Staging\n\nThe staging cluster is named falcon-staging and runs in eu-west-1.\nIt is sized for integration tests and is rebuilt every night from the\nTerraform modules in the platform-infra repository. Staging nodes use\nspot instances and are allowed to restart without notice. Operators reach\nstaging through the bastion in the shared services account; the cluster\nitself is not reachable from the public internet. Logs from staging are\nretained for seven days because the environment is disposable.\n\n## Change process\n\nRollbacks require two approvals from the platform team.\nA normal deployment needs one approval from the service owner and a green\nintegration run. Deployments are frozen during the December code freeze,\nand a weekly change freeze also applies every Friday after 16:00 UTC.\nThe on-call rotation is published every Monday in the handbook calendar.\nEmergency changes may skip the review queue but still need an incident\nlink in the change record. Every change record must name a rollback plan.\n\n## Storage\n\nPostgres backups are kept for thirty days in the archive bucket.\nThe archive bucket is named recall-archive-2026 and lives in the same\nregion as production. Backups are encrypted with the platform KMS key\nand restored monthly during the disaster-recovery drill. Object lifecycle\nrules move backups older than thirty days to cold storage before deletion.\nThe restore drill is scheduled on the first Tuesday of each month.\n\n## Production and incidents\n\nThe production cluster is named falcon-prod and runs in us-east-2.\nProduction nodes are spread across three availability zones and use the\ngraviton instance family. Cluster upgrades follow the blue-green runbook\nand must be announced in the platform-ops channel one day in advance.\nA sev1 incident pages the on-call engineer through Opsgenie immediately.\nThe incident commander opens a shared timeline within ten minutes and\nposts updates every thirty minutes until the incident is resolved.\nA blameless postmortem is due within five business days, and every action\nitem must have an owner and a due date. Customer-facing incidents also\nrequire a status page update.\n"
+    }
+  ],
+  "questions": [
+    {
+      "id": "exact_employer",
+      "q": "I work at Globex Inc.",
+      "mode": "memories",
+      "category": "exact",
+      "expect": [
+        "Globex"
+      ]
+    },
+    {
+      "id": "exact_location",
+      "q": "I now live in Lisbon.",
+      "mode": "memories",
+      "category": "exact",
+      "expect": [
+        "Lisbon"
+      ]
+    },
+    {
+      "id": "exact_editor",
+      "q": "I use Neovim as my editor.",
+      "mode": "memories",
+      "category": "exact",
+      "expect": [
+        "Neovim"
+      ]
+    },
+    {
+      "id": "exact_atlas",
+      "q": "Project Atlas uses PostgreSQL for its primary datastore.",
+      "mode": "memories",
+      "category": "exact",
+      "expect": [
+        "Atlas"
+      ]
+    },
+    {
+      "id": "work_where",
+      "q": "Where does the user work?",
+      "mode": "memories",
+      "category": "paraphrase",
+      "expect": [
+        "Globex"
+      ],
+      "forbid": [
+        "Acme Corp"
+      ]
+    },
+    {
+      "id": "work_employer",
+      "q": "Which company employs the user?",
+      "mode": "memories",
+      "category": "paraphrase",
+      "expect": [
+        "Globex"
+      ],
+      "forbid": [
+        "Acme Corp"
+      ]
+    },
+    {
+      "id": "work_now",
+      "q": "Where does the user work now?",
+      "mode": "memories",
+      "category": "paraphrase",
+      "expect": [
+        "Globex"
+      ],
+      "forbid": [
+        "Acme Corp"
+      ]
+    },
+    {
+      "id": "live_city",
+      "q": "Where is the user based?",
+      "mode": "memories",
+      "category": "paraphrase",
+      "expect": [
+        "Lisbon"
+      ],
+      "forbid": [
+        "Berlin"
+      ]
+    },
+    {
+      "id": "live_home",
+      "q": "Which city does the user call home?",
+      "mode": "memories",
+      "category": "paraphrase",
+      "expect": [
+        "Lisbon"
+      ],
+      "forbid": [
+        "Berlin"
+      ]
+    },
+    {
+      "id": "role_title",
+      "q": "What is the user's job title?",
+      "mode": "memories",
+      "category": "paraphrase",
+      "expect": [
+        "staff engineer"
+      ],
+      "forbid": [
+        "backend engineer"
+      ]
+    },
+    {
+      "id": "role_kind",
+      "q": "What kind of engineer is the user?",
+      "mode": "memories",
+      "category": "paraphrase",
+      "expect": [
+        "staff engineer"
+      ]
+    },
+    {
+      "id": "lang_pref",
+      "q": "Which programming language does the user like best?",
+      "mode": "memories",
+      "category": "paraphrase",
+      "expect": [
+        "Python"
+      ],
+      "forbid": [
+        "Rust"
+      ]
+    },
+    {
+      "id": "editor_pref",
+      "q": "What text editor does the user prefer?",
+      "mode": "memories",
+      "category": "paraphrase",
+      "expect": [
+        "Neovim"
+      ]
+    },
+    {
+      "id": "working_on",
+      "q": "What is the user working on right now?",
+      "mode": "memories",
+      "category": "paraphrase",
+      "expect": [
+        "billing migration"
+      ]
+    },
+    {
+      "id": "atlas_db_q",
+      "q": "Which database does Project Atlas use?",
+      "mode": "memories",
+      "category": "entity",
+      "expect": [
+        "Atlas",
+        "PostgreSQL"
+      ]
+    },
+    {
+      "id": "apollo_db_q",
+      "q": "Which database does Project Apollo use?",
+      "mode": "memories",
+      "category": "entity",
+      "expect": [
+        "Apollo",
+        "MongoDB"
+      ]
+    },
+    {
+      "id": "atlas_owner_q",
+      "q": "Who owns Project Atlas?",
+      "mode": "memories",
+      "category": "relationship",
+      "expect": [
+        "payments team"
+      ]
+    },
+    {
+      "id": "apollo_owner_q",
+      "q": "Who owns Project Apollo?",
+      "mode": "memories",
+      "category": "relationship",
+      "expect": [
+        "growth team"
+      ]
+    },
+    {
+      "id": "payments_project",
+      "q": "Which project is owned by the payments team?",
+      "mode": "memories",
+      "category": "relationship",
+      "expect": [
+        "Atlas"
+      ]
+    },
+    {
+      "id": "mongo_project",
+      "q": "Which project uses MongoDB?",
+      "mode": "memories",
+      "category": "relationship",
+      "expect": [
+        "Apollo"
+      ]
+    },
+    {
+      "id": "postgres_project",
+      "q": "Which project uses PostgreSQL?",
+      "mode": "memories",
+      "category": "relationship",
+      "expect": [
+        "Atlas"
+      ]
+    },
+    {
+      "id": "updated_location",
+      "q": "Where does the user live?",
+      "mode": "memories",
+      "category": "updated",
+      "expect": [
+        "Lisbon"
+      ],
+      "forbid": [
+        "Berlin"
+      ]
+    },
+    {
+      "id": "updated_role",
+      "q": "What is the user's current role?",
+      "mode": "memories",
+      "category": "updated",
+      "expect": [
+        "staff engineer"
+      ],
+      "forbid": [
+        "backend engineer"
+      ]
+    },
+    {
+      "id": "updated_lang",
+      "q": "Which language does the user prefer now?",
+      "mode": "memories",
+      "category": "updated",
+      "expect": [
+        "Python"
+      ],
+      "forbid": [
+        "Rust"
+      ]
+    },
+    {
+      "id": "conflict_db",
+      "q": "What is the user's favorite database?",
+      "mode": "memories",
+      "category": "conflict",
+      "expect": [
+        "SQLite"
+      ],
+      "forbid": [
+        "My favorite database is PostgreSQL"
+      ]
+    },
+    {
+      "id": "doc_staging_region",
+      "q": "Which region does the staging cluster run in?",
+      "mode": "documents",
+      "category": "document",
+      "expect": [
+        "eu-west-1"
+      ],
+      "provenance": {
+        "filename": "deployment-notes.md"
+      }
+    },
+    {
+      "id": "doc_staging_name",
+      "q": "What is the name of the staging cluster?",
+      "mode": "documents",
+      "category": "document",
+      "expect": [
+        "falcon-staging"
+      ],
+      "provenance": {
+        "filename": "deployment-notes.md"
+      }
+    },
+    {
+      "id": "doc_staging_where",
+      "q": "Where is falcon-staging deployed?",
+      "mode": "documents",
+      "category": "document",
+      "expect": [
+        "eu-west-1"
+      ],
+      "provenance": {
+        "filename": "deployment-notes.md"
+      }
+    },
+    {
+      "id": "doc_prod_name",
+      "q": "What is the name of the production cluster?",
+      "mode": "documents",
+      "category": "document",
+      "expect": [
+        "falcon-prod"
+      ],
+      "provenance": {
+        "filename": "deployment-notes.md"
+      }
+    },
+    {
+      "id": "doc_prod_region",
+      "q": "Which region does the production cluster run in?",
+      "mode": "documents",
+      "category": "document",
+      "expect": [
+        "us-east-2"
+      ],
+      "provenance": {
+        "filename": "deployment-notes.md"
+      }
+    },
+    {
+      "id": "doc_rollback",
+      "q": "How many approvals are needed for a rollback?",
+      "mode": "documents",
+      "category": "document",
+      "expect": [
+        "two approvals"
+      ],
+      "provenance": {
+        "filename": "deployment-notes.md"
+      }
+    },
+    {
+      "id": "doc_oncall",
+      "q": "How often is the on-call rotation published?",
+      "mode": "documents",
+      "category": "document",
+      "expect": [
+        "every Monday"
+      ],
+      "provenance": {
+        "filename": "deployment-notes.md"
+      }
+    },
+    {
+      "id": "doc_backups",
+      "q": "How long are Postgres backups retained?",
+      "mode": "documents",
+      "category": "document",
+      "expect": [
+        "thirty days"
+      ],
+      "provenance": {
+        "filename": "deployment-notes.md"
+      }
+    },
+    {
+      "id": "doc_bucket",
+      "q": "What is the archive bucket called?",
+      "mode": "documents",
+      "category": "document",
+      "expect": [
+        "recall-archive-2026"
+      ],
+      "provenance": {
+        "filename": "deployment-notes.md"
+      }
+    },
+    {
+      "id": "doc_sev1",
+      "q": "What tool pages the on-call engineer for a sev1 incident?",
+      "mode": "documents",
+      "category": "document",
+      "expect": [
+        "Opsgenie"
+      ],
+      "provenance": {
+        "filename": "deployment-notes.md"
+      }
+    },
+    {
+      "id": "doc_postmortem",
+      "q": "When is a postmortem due after an incident?",
+      "mode": "documents",
+      "category": "document",
+      "expect": [
+        "five business days"
+      ],
+      "provenance": {
+        "filename": "deployment-notes.md"
+      }
+    },
+    {
+      "id": "typo_work",
+      "q": "Where does the user wrok?",
+      "mode": "memories",
+      "category": "edge",
+      "expect": [
+        "Globex"
+      ]
+    },
+    {
+      "id": "lower_work",
+      "q": "where does the user work",
+      "mode": "memories",
+      "category": "edge",
+      "expect": [
+        "Globex"
+      ]
+    },
+    {
+      "id": "none_mongolia",
+      "q": "What is the capital of Mongolia?",
+      "mode": "memories",
+      "category": "noanswer",
+      "noAnswer": true
+    },
+    {
+      "id": "none_pizza",
+      "q": "What is the user's favorite pizza topping?",
+      "mode": "memories",
+      "category": "noanswer",
+      "noAnswer": true
+    },
+    {
+      "id": "none_hate",
+      "q": "Which programming language does the user hate?",
+      "mode": "memories",
+      "category": "noanswer",
+      "noAnswer": true
+    },
+    {
+      "id": "none_school",
+      "q": "Where did the user go to university?",
+      "mode": "memories",
+      "category": "noanswer",
+      "noAnswer": true
+    },
+    {
+      "id": "none_phone",
+      "q": "What is the user's phone number?",
+      "mode": "memories",
+      "category": "noanswer",
+      "noAnswer": true
+    },
+    {
+      "id": "ambiguous",
+      "q": "What about the other one?",
+      "mode": "memories",
+      "category": "noanswer",
+      "noAnswer": true
+    }
+  ],
+  "deletion": {
+    "document": "deployment_notes",
+    "questions": [
+      "doc_staging_region",
+      "doc_bucket"
+    ]
+  },
+  "thresholds": {
+    "top1": 0.8,
+    "recall5": 0.9,
+    "stale": 0
+  }
+}
