@@ -81,6 +81,16 @@ jobs:
           test "$code" = "0" || { echo "unclean exit: $code"; exit 1; }
           docker rm recall-ci
 
+      - name: Suite against the runtime image
+        run: |
+          set -euo pipefail
+          # The image intentionally excludes test/, so mount it read-only. This
+          # runs the suite in the image's own environment (node user, production
+          # defaults, Linux native modules) instead of only on the runner. NODE_ENV
+          # is relaxed because some tests exercise AUTH_MODE=dev.
+          docker run --rm -e NODE_ENV=test -v "$PWD/test:/app/test:ro" \
+            --entrypoint sh recall:ci -c 'node --test test/*.test.js'
+
       - name: Verify local ONNX model loads on Linux
         run: |
           set -euo pipefail

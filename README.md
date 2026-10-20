@@ -735,6 +735,13 @@ compose file publishes the port on **loopback only** and enforces
 `AUTH_MODE=required`. To expose the service, put an authenticated, TLS-enabled
 reverse proxy in front; never publish it directly.
 
+Inside the container the process binds `0.0.0.0` (Docker cannot forward a
+loopback-only listener), so in a container **port publishing is the security
+boundary**: keep it on `127.0.0.1`. Direct installs still default to
+`HOST=127.0.0.1`. The image deliberately does not set `UPLOAD_DIR`, so uploads
+keep deriving from `DATA_DIR`; if you override `DATA_DIR`, the files follow it
+onto the same volume instead of landing in the container's ephemeral layer.
+
 Two volumes hold state:
 
 | Volume | Mount | Contents | Backed up |

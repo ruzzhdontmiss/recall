@@ -28,11 +28,13 @@ COPY package.json package-lock.json .npmrc ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 FROM node:22-bookworm-slim AS runtime
+# UPLOAD_DIR is deliberately NOT set: it must keep deriving from DATA_DIR, so a
+# deployment that overrides DATA_DIR still keeps uploads on that same volume
+# instead of silently writing them into the container's ephemeral filesystem.
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=6767 \
     DATA_DIR=/app/data \
-    UPLOAD_DIR=/app/data/uploads \
     EMBEDDINGS_CACHE_DIR=/app/.cache/transformers
 WORKDIR /app
 # libgomp1   — OpenMP runtime linked by onnxruntime-node

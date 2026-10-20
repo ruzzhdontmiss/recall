@@ -147,6 +147,10 @@ async function runScenario(scenario) {
     PORT: String(port),
     EXTRACTION_PROVIDER: "regex",
   };
+  // Never inherit an ambient bind override. This matrix asserts the server's own
+  // default (loopback-only); a host or image that sets HOST must not silently
+  // turn that security check into a no-op.
+  delete env.HOST;
 
   let key = scenario.key ? mintKey(env, scenario.key.tenant, scenario.key.container) : "";
   const server = spawn(process.execPath, [SERVER], {
