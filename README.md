@@ -662,9 +662,12 @@ SMOKE_SKIP_DENSE=1 npm run smoke:matrix   # skip the scenarios that load the loc
 - **Model cache.** `EMBEDDINGS_CACHE_DIR` defaults inside `node_modules`, so a container must
   mount a persistent volume for it (or point it elsewhere) to avoid re-downloading the model on
   every start.
-- **Cross-platform.** The suite is verified on macOS (darwin-arm64). macOS verification does not
-  prove a Linux/container target; validate that explicitly with the provided container recipe
-  before deployment.
+- **Cross-platform.** Verified on macOS (darwin-arm64) and in the Linux image on both
+  `linux/amd64` and `linux/arm64` (Node 22): build from the committed lockfile, the full suite,
+  native ONNX inference returning `ranking: "dense"` (the `onnxruntime-node` shared library is
+  confirmed mapped in the process), database/uploads persistence across a restart, graceful
+  `SIGTERM` (exit 0), non-root execution, and loopback-only publishing. The `container` CI job
+  repeats the build and runtime checks on `ubuntu-latest`.
 
 
 The document suite (`test/documents.test.js`, `test/rank-chunks.test.js`) covers happy-path
