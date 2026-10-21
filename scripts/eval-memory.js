@@ -4,6 +4,7 @@
 //   npm run eval:memory                 # dense (default provider)
 //   EMBEDDINGS_PROVIDER=tfidf npm run eval:memory
 //   node scripts/eval-memory.js --strict
+//   node scripts/eval-memory.js --diagnose --abstention
 //
 // The dataset lives in scripts/fixtures/memory-eval.json. It is ingested through
 // the real HTTP API into a throwaway DATA_DIR, then queried through /v1/search.
@@ -28,6 +29,14 @@ const path = require("path");
 const REPO = path.join(__dirname, "..");
 const dataset = require("./fixtures/memory-eval.json");
 const strict = process.argv.includes("--strict");
+// Diagnostic output for misses: full candidate scores plus what a pure lexical
+// ranking of the same corpus would have returned. Diagnostic only; it never
+// changes the metrics above.
+const diagnose = process.argv.includes("--diagnose");
+// Print the score/abstention trade-off curve. Opt-in because it is a diagnostic
+// of a client policy, not a retrieval-quality threshold.
+const abstention = process.argv.includes("--abstention");
+const { buildIndex } = require(path.join(REPO, "lib", "tfidf"));
 
 const ownDir = !process.env.MEMORY_EVAL_DATA_DIR;
 const dataDir =
@@ -249,6 +258,31 @@ async function main() {
       topText: hits[0] ? hits[0].text : null,
       ranking: r.body.ranking,
     });
+
+    if (diagnose && !top1) {
+      console.log(`\n[miss] ${q.id}: ${JSON.stringify(q.q)} (mode=${q.mode})`);
+      console.log(`  expected ${JSON.stringify(q.expect)}; ranking=${r.body.ranking}`);
+      hits.slice(0, 5).forEach((hit, i) => {
+        const mark = matches(hit) ? "  <-- expected" : "";
+        console.log(
+          `  ${i + 1}. ${hit.score.toFixed(4)} ${hit.source.padEnd(8)} ` +
+            `${JSON.stringify(String(hit.text).slice(0, 110))}${mark}`
+        );
+      });
+      if (q.forbid) console.log(`  forbid ${JSON.stringify(q.forbid)}`);
+
+      const corpus = q.mode === "documents" ? chunkText : activeMemories;
+      const lexical = buildIndex(corpus.map((text, i) => ({ id: String(i), text })));
+      console.log("  lexical top-5:");
+      lexical
+        .score(q.q)
+        .slice(0, 5)
+        .forEach((row, i) => {
+          console.log(
+            `  ${i + 1}. ${row.score.toFixed(4)} ${JSON.stringify(String(corpus[row.id]).slice(0, 110))}`
+          );
+        });
+    }
   }
 
   // --------------------------------------------------------------- deletion --
@@ -332,6 +366,37 @@ async function main() {
         `  empirical floor (lowest correct top-1): ${floor.toFixed(4)}; ` +
           `${misleading.length}/${results.noAnswer.length} no-answer probe(s) at or above it`
       );
+
+      if (abstention) {
+        // A positive is a correct top-1 answer; a false positive is a no-answer
+        // probe that still returns a hit. Answerable questions whose top-1 is
+        // already wrong are excluded from TP/FN because a threshold cannot
+        // recover them. This makes the trade-off explicit instead of implying
+        // that one global cutoff is safe.
+        console.log("\nabstention trade-off (opt-in minScore; scores are not calibrated):");
+        console.log("  threshold   TP   FN   FP   TN   precision   recall");
+        let best = null;
+        for (let t = 0.4; t <= 0.8001; t += 0.05) {
+          const tp = correct.filter((q) => q.topScore >= t).length;
+          const fn = correct.length - tp;
+          const fp = results.noAnswer.filter((n) => n.topScore >= t).length;
+          const tn = results.noAnswer.length - fp;
+          const precision = tp + fp ? tp / (tp + fp) : 0;
+          const recall = correct.length ? tp / correct.length : 0;
+          const f1 = precision + recall ? (2 * precision * recall) / (precision + recall) : 0;
+          if (!best || f1 > best.f1) best = { t, f1, precision, recall, fn, fp };
+          console.log(
+            `  ${t.toFixed(2).padEnd(10)} ${String(tp).padEnd(4)} ${String(fn).padEnd(4)} ` +
+              `${String(fp).padEnd(4)} ${String(tn).padEnd(4)} ${precision.toFixed(3).padEnd(11)} ${recall.toFixed(3)}`
+          );
+        }
+        if (best) {
+          console.log(
+            `  best F1 at this small sample: threshold=${best.t.toFixed(2)} ` +
+              `(FN=${best.fn}, FP=${best.fp}); do not treat it as a universal default`
+          );
+        }
+      }
     }
   }
 

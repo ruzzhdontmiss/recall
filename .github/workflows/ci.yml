@@ -97,7 +97,7 @@ jobs:
           set -euo pipefail
           # The default provider runs the native ONNX runtime. Prove it loads (and
           # the model downloads and caches) inside the Linux image, and that
-          # ranking is genuinely dense — not a silent lexical fallback.
+          # ranking is genuinely dense+hybrid — not a silent lexical fallback.
           docker run -d --name recall-onnx -p 127.0.0.1:6768:6767 -e EXTRACTION_PROVIDER=regex recall:ci
           for i in $(seq 1 60); do
             if curl -fsS http://127.0.0.1:6768/readyz >/dev/null 2>&1; then break; fi

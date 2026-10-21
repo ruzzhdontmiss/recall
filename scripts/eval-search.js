@@ -53,9 +53,10 @@ async function main() {
       "still on tf-idf (xenova did not load). Semantic paraphrase match is not expected."
     );
   }
-  if (ranking !== "dense") {
+  if (ranking !== "hybrid") {
     throw new Error(
-      `search fell back to lexical ranking (ranking=${ranking}); this is not a semantic match`
+      `search did not use the dense+lexical ranking path (ranking=${ranking}); ` +
+        "this is not a semantic match"
     );
   }
   if (!ok) {

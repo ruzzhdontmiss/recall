@@ -90,11 +90,11 @@ async function main() {
   const search = await request("GET", `/v1/search?q=${encodeURIComponent(token)}`);
   check("GET /v1/search ranks a result", search.status === 200 && (search.json?.results || []).length > 0,
     `status=${search.status} results=${(search.json?.results || []).length}`);
-  check("search reports an honest ranking field", ["dense", "lexical", "none"].includes(search.json?.ranking),
+  check("search reports an honest ranking field", ["dense", "hybrid", "lexical", "none"].includes(search.json?.ranking),
     `ranking=${search.json?.ranking}`);
-  // A response must never present a lexical fallback as semantic search.
-  check("search does not claim dense ranking for a lexical provider",
-    !(search.json?.ranking === "dense" && search.json?.embeddingsProvider === "tfidf"));
+  // A response must never present a lexical fallback as semantic/hybrid search.
+  check("search does not claim semantic ranking for a lexical provider",
+    !(["dense", "hybrid"].includes(search.json?.ranking) && search.json?.embeddingsProvider === "tfidf"));
 
   const profile = await request("GET", `/v1/profile?q=${encodeURIComponent(token)}`);
   check("GET /v1/profile responds", profile.status === 200, `status=${profile.status}`);

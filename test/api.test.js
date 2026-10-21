@@ -128,6 +128,36 @@ test("search supports all three modes", async () => {
   }
 });
 
+test("search accepts an opt-in minScore floor and validates it", async () => {
+  await postAdd("I use Neovim as my editor.", "api_min");
+  const all = await json("/v1/search?q=Neovim&containerTag=api_min&searchMode=memories");
+  assert.equal(all.status, 200);
+  assert.ok(all.body.results.length > 0);
+  assert.equal(all.body.minScore, 0, "the default floor preserves the existing behaviour");
+
+  const top = all.body.results[0].score;
+  const atTop = await json(
+    `/v1/search?q=Neovim&containerTag=api_min&searchMode=memories&minScore=${encodeURIComponent(top)}`
+  );
+  assert.equal(atTop.status, 200);
+  assert.ok(atTop.body.results.length >= 1);
+  assert.ok(atTop.body.results.every((r) => r.score >= top));
+  assert.equal(atTop.body.minScore, top);
+
+  const none = await json(
+    "/v1/search?q=Neovim&containerTag=api_min&searchMode=memories&minScore=1"
+  );
+  assert.deepEqual(none.body.results, [], "a floor above every score returns no hits");
+
+  for (const bad of ["-0.1", "1.1", "abc", ""]) {
+    const res = await json(
+      `/v1/search?q=Neovim&containerTag=api_min&minScore=${encodeURIComponent(bad)}`
+    );
+    assert.equal(res.status, 400, `minScore=${JSON.stringify(bad)} must be rejected`);
+    assert.match(res.body.error, /minScore/);
+  }
+});
+
 test("cross-container deletion is blocked (IDOR regression)", async () => {
   await postAdd("I live in Berlin.", "victim");
   const victimMem = (await json("/v1/memories?containerTag=victim")).body.memories[0];

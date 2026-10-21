@@ -9,6 +9,7 @@ const { createLimiter, createRateLimitMiddleware } = require("./lib/ratelimit");
 const {
   validateContent,
   validateQuery,
+  validateMinScore,
   isValidContainerTag,
   isValidId,
   isValidSearchMode,
@@ -396,6 +397,11 @@ function createApp(config = readConfig()) {
       const { q, searchMode } = req.query;
       const qError = validateQuery(q);
       if (qError) return res.status(qError.status).json({ error: qError.error });
+      const minScoreError = validateMinScore(req.query.minScore);
+      if (minScoreError) {
+        return res.status(minScoreError.status).json({ error: minScoreError.error });
+      }
+      const minScore = req.query.minScore === undefined ? 0 : Number(req.query.minScore);
 
       const mode = searchMode || "hybrid";
       if (!isValidSearchMode(mode)) {
@@ -410,7 +416,7 @@ function createApp(config = readConfig()) {
       const mems = db.listMemories(tag).filter((m) => effectiveStatus(m, now) === "active");
 
       // Records how ranking was actually produced so the response can report the
-      // truth (dense vs lexical) rather than only the configured provider.
+      // truth (dense/hybrid vs lexical) rather than only the configured provider.
       const rankingState = createRankingState();
       let results = [];
       if (mode === "memories") {
@@ -438,15 +444,19 @@ function createApp(config = readConfig()) {
       }
 
       res.json({
-        results: results.slice(0, 20),
+        results: results.filter((hit) => hit.score >= minScore).slice(0, 20),
         searchMode: mode,
         containerTag: tag,
         // The loaded provider, and the ranking this specific response actually
         // used. `ranking` is authoritative: it is "lexical" whenever any part of
         // the result fell back to TF-IDF (so a caller never mistakes a lexical
-        // response for a semantic one).
+        // response for a semantic one), and "hybrid" when dense candidates were
+        // reranked with lexical/slot evidence.
         embeddingsProvider: embeddings.getProviderName(),
         ranking: rankingMode(rankingState),
+        // Echo the opt-in floor. Default 0 preserves the historical "return all
+        // scored candidates" behavior; clients can raise it for abstention.
+        minScore,
       });
     })
   );
