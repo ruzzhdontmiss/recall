@@ -4,8 +4,6 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>recall — a supermemory clone</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
@@ -32,6 +30,7 @@
 
     <!-- LEFT: profile -->
     <aside class="profile-pane">
+      <div id="banner" class="banner" hidden></div>
       <h2 class="pane-title">who this is</h2>
       <p class="pane-sub">durable facts, kept until something contradicts them</p>
       <ul id="staticList" class="fact-list fact-list--static"></ul>
@@ -70,9 +69,17 @@
         <ul id="searchResults" class="result-list"></ul>
       </div>
 
+      <div class="card memories-card">
+        <h2 class="pane-title">memories</h2>
+        <p class="pane-sub">everything stored in this space — inspect or forget</p>
+        <ul id="memoryList" class="result-list"></ul>
+      </div>
+
       <div class="card feed-card">
-        <h2 class="pane-title">recent captures</h2>
+        <h2 class="pane-title">documents</h2>
+        <p class="pane-sub">notes and uploads — click one to see its source passages</p>
         <ul id="docFeed" class="doc-feed"></ul>
+        <div id="docDetail" class="doc-detail" hidden></div>
       </div>
 
     </section>

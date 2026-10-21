@@ -19,39 +19,42 @@ const {
   searchHybrid,
   searchProfile,
   searchDocumentsWithChunks,
+  createRankingState,
+  rankingMode,
 } = require("./lib/search");
 const { ingestUpload } = require("./lib/documents/ingest");
 const fileStore = require("./lib/documents/storage");
+const { shutdownPdfWorkers } = require("./lib/documents/pdf");
 const { readConfig: readDocConfig } = require("./lib/documents/config");
+// Configuration is read per createApp() call so tests can build isolated apps
+// with different auth/limit settings. Validation lives in lib/config.js.
+const { readServerConfig: readConfig } = require("./lib/config");
 
-const PORT = process.env.PORT || 6767;
+const VERSION = pkgVersion();
 
-function toPosInt(value, fallback) {
-  const n = Number.parseInt(value, 10);
-  return Number.isFinite(n) && n > 0 ? n : fallback;
+function pkgVersion() {
+  try {
+    return require("./package.json").version || "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
 }
 
-// Configuration is read per createApp() call so tests can build isolated apps
-// with different auth/limit settings.
-function readConfig(env = process.env) {
-  const authMode = (env.AUTH_MODE || "required").toLowerCase().trim();
-  if (authMode !== "required" && authMode !== "dev") {
-    throw new Error(`unknown AUTH_MODE=${authMode} (expected "required" or "dev")`);
-  }
-  if (authMode === "dev" && env.NODE_ENV === "production") {
-    throw new Error("AUTH_MODE=dev is not allowed when NODE_ENV=production");
-  }
-  return {
-    authMode,
-    devTenant: env.DEV_TENANT || "dev",
-    devContainer: env.DEV_CONTAINER || "dev",
-    generalMax: toPosInt(env.RATE_LIMIT_PER_MIN, 120),
-    expensiveMax: toPosInt(env.RATE_LIMIT_EXPENSIVE_PER_MIN, 30),
-    corsOrigins: String(env.CORS_ORIGINS || "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean),
-  };
+// The dashboard loads its fonts from Google Fonts; everything else is same-origin.
+// `style-src` therefore allows that stylesheet origin and `font-src` its files.
+function contentSecurityPolicy() {
+  return [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self'",
+    "font-src 'self'",
+    "img-src 'self' data:",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+  ].join("; ");
 }
 
 function asyncRoute(fn) {
@@ -64,10 +67,19 @@ function createApp(config = readConfig()) {
   const app = express();
 
   // -------------------------------------------------------- hardening -----
+  // Do not advertise the framework, and send a strict, self-only policy so a
+  // future XSS in the dashboard cannot exfiltrate the API key or load remote
+  // code. No cookies or ambient credentials are ever used, so CORS/CSRF is a
+  // browser-read concern only (a cross-site <form> cannot send Authorization).
+  app.disable("x-powered-by");
   app.use((req, res, next) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("X-Frame-Options", "DENY");
     res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("Content-Security-Policy", contentSecurityPolicy());
+    res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+    res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+    res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
     next();
   });
 
@@ -90,6 +102,78 @@ function createApp(config = readConfig()) {
 
   app.use(express.json({ limit: "2mb" }));
   app.use(express.static(path.join(__dirname, "public")));
+
+  // ---------------------------------------------------------- health --------
+  // Liveness and readiness for orchestrators. Both are unauthenticated (a probe
+  // cannot hold a key) and expose only coarse, non-secret detail — versions,
+  // booleans, provider names and error codes, never paths, content or tenants.
+  let draining = false;
+  // Called on shutdown so a load balancer stops routing here before we exit.
+  app.beginDraining = () => {
+    draining = true;
+  };
+
+  // Liveness: the process is up and serving HTTP. Deliberately does not touch any
+  // dependency, so a transient outage cannot trigger a restart loop.
+  app.get("/healthz", (req, res) => {
+    res.json({
+      status: "ok",
+      service: "recall",
+      version: VERSION,
+      uptimeSeconds: Math.round(process.uptime()),
+    });
+  });
+
+  // Readiness: whether this instance can serve requests, with per-dependency
+  // detail. 503 while draining or when a hard dependency is unusable.
+  app.get("/readyz", (req, res) => {
+    const report = readinessReport();
+    res.status(report.ready ? 200 : 503).json(report);
+  });
+
+  function readinessReport() {
+    const dependencies = {};
+
+    try {
+      db.ping();
+      dependencies.database = { ok: true, backend: db.backend };
+    } catch (err) {
+      dependencies.database = { ok: false, code: (err && err.code) || "EUNKNOWN" };
+    }
+
+    const storage = fileStore.probe();
+    dependencies.storage = storage.ok ? { ok: true } : { ok: false, code: storage.code };
+
+    // Embeddings are advisory: a lexical fallback still serves search, so an
+    // unusable provider must not make the instance unready (that would
+    // restart-loop a healthy service during a provider outage). It is reported
+    // so an operator can still see the degradation.
+    let provider = "uninitialized";
+    let configured = "uninitialized";
+    let dense = false;
+    let space = "uninitialized";
+    try {
+      provider = embeddings.getProviderName();
+      configured = embeddings.describe().provider;
+      dense = embeddings.isDense();
+      space = embeddings.activeSpace();
+    } catch {
+      /* keep the conservative defaults */
+    }
+    dependencies.embeddings = { ok: true, provider, configured, dense, space };
+
+    const ready = !draining && dependencies.database.ok && dependencies.storage.ok;
+    // "degraded" = a dense provider was requested but search is running lexically.
+    const degraded = configured !== "tfidf" && !dense;
+    return {
+      status: !ready ? "unavailable" : degraded ? "degraded" : "ready",
+      ready,
+      degraded,
+      draining,
+      version: VERSION,
+      dependencies,
+    };
+  }
 
   // ----------------------------------------------------------- auth ------
   if (config.authMode === "dev") {
@@ -134,6 +218,53 @@ function createApp(config = readConfig()) {
 
   // Remove any temp files left behind by a crash mid-upload.
   fileStore.sweepTemps();
+
+  // Embedding-space bookkeeping. Run AFTER warmup (see the listen callback) so it
+  // reflects the provider that actually loaded: if no provider is usable (the
+  // local provider failed over to lexical, or a hosted provider failed to
+  // initialize) we must not record a dense space. Per-row detection still
+  // prevents mixed scoring (foreign vectors are re-embedded before use); this is
+  // the operator-facing signal that a full offline reindex is due.
+  //
+  // The recorded space is only (re)written for a store that holds NO stored
+  // vectors. A store that already holds vectors but names no space (a pre-Phase-A
+  // store, or one whose reindex never completed) is reported as a legacy/unknown
+  // space and deliberately left unrecorded, so the warning keeps firing until a
+  // verified `embeddings:reindex -- --apply` records the space. This never
+  // overwrites existing evidence of an incomplete migration.
+  function checkEmbeddingSpace() {
+    try {
+      const currentSpace = embeddings.activeSpace();
+      const providerReady =
+        typeof embeddings.isInitialized === "function" ? embeddings.isInitialized() : true;
+      const recordedSpace = typeof db.getMeta === "function" ? db.getMeta("embedding_space") : null;
+      const hasVectors =
+        typeof db.hasStoredVectors === "function" ? db.hasStoredVectors() : false;
+
+      if (hasVectors && recordedSpace && recordedSpace !== currentSpace) {
+        console.warn(
+          `[embeddings] stored vectors are from a different space (recorded=${recordedSpace}, ` +
+            `current=${currentSpace}); run "npm run embeddings:reindex" (dry-run) then ` +
+            `"npm run embeddings:reindex -- --apply" to re-embed the whole corpus.`
+        );
+      } else if (hasVectors && !recordedSpace) {
+        console.warn(
+          `[embeddings] stored vectors exist but no embedding space is recorded; treating them ` +
+            `as a legacy/unknown space. Run "npm run embeddings:reindex" (dry-run) then ` +
+            `"npm run embeddings:reindex -- --apply" to verify and record the space.`
+        );
+      } else if (!hasVectors && providerReady && recordedSpace !== currentSpace) {
+        // A genuinely empty store: (re)record the current space so a later change
+        // is detected. Skipped when no provider is available — there is nothing
+        // meaningful to record yet, and recording the configured (unloaded)
+        // provider would be misleading.
+        if (typeof db.setMeta === "function") db.setMeta("embedding_space", currentSpace);
+      }
+    } catch (err) {
+      console.warn(`[embeddings] space check failed: ${err.message}`);
+    }
+  }
+  app.checkEmbeddingSpace = checkEmbeddingSpace;
 
   app.use("/v1", ipLimiter, auth, generalLimiter);
 
@@ -278,9 +409,12 @@ function createApp(config = readConfig()) {
       const docs = db.listDocuments(tag);
       const mems = db.listMemories(tag).filter((m) => effectiveStatus(m, now) === "active");
 
+      // Records how ranking was actually produced so the response can report the
+      // truth (dense vs lexical) rather than only the configured provider.
+      const rankingState = createRankingState();
       let results = [];
       if (mode === "memories") {
-        results = await searchMemories(q, mems);
+        results = await searchMemories(q, mems, rankingState);
       } else {
         // Uploaded files are searchable at chunk granularity; raw-text documents
         // (which have no chunks) keep the original document-level ranking. Failed
@@ -291,9 +425,15 @@ function createApp(config = readConfig()) {
         const docById = new Map(docs.map((d) => [d.id, d]));
         const plainDocs = docs.filter((d) => d.status !== "failed" && !d.chunkCount);
         if (mode === "documents") {
-          results = await searchDocumentsWithChunks({ q, docs: plainDocs, chunks, docById });
+          results = await searchDocumentsWithChunks({
+            q,
+            docs: plainDocs,
+            chunks,
+            docById,
+            state: rankingState,
+          });
         } else {
-          results = await searchHybrid({ q, docs: plainDocs, mems, chunks, docById });
+          results = await searchHybrid({ q, docs: plainDocs, mems, chunks, docById, state: rankingState });
         }
       }
 
@@ -301,7 +441,12 @@ function createApp(config = readConfig()) {
         results: results.slice(0, 20),
         searchMode: mode,
         containerTag: tag,
+        // The loaded provider, and the ranking this specific response actually
+        // used. `ranking` is authoritative: it is "lexical" whenever any part of
+        // the result fell back to TF-IDF (so a caller never mistakes a lexical
+        // response for a semantic one).
         embeddingsProvider: embeddings.getProviderName(),
+        ranking: rankingMode(rankingState),
       });
     })
   );
@@ -338,12 +483,19 @@ function createApp(config = readConfig()) {
       };
 
       let searchResults = undefined;
+      const rankingState = createRankingState();
       if (req.query.q) {
         const active = mems.filter((m) => effectiveStatus(m, now) === "active");
-        searchResults = await searchProfile(req.query.q, active);
+        searchResults = await searchProfile(req.query.q, active, 10, rankingState);
       }
 
-      res.json({ containerTag: tag, profile, searchResults });
+      res.json({
+        containerTag: tag,
+        profile,
+        searchResults,
+        // Only meaningful when a query was supplied; "none" otherwise.
+        ranking: rankingMode(rankingState),
+      });
     })
   );
 
@@ -442,6 +594,16 @@ function createApp(config = readConfig()) {
     });
   });
 
+  // --------------------------------------------------------------- 404 ----
+  // Unknown API paths answer with JSON (never the framework's HTML page, which
+  // would advertise the stack); everything else gets a plain 404.
+  app.use((req, res) => {
+    if (req.path === "/v1" || req.path.startsWith("/v1/")) {
+      return res.status(404).json({ error: "not found" });
+    }
+    res.status(404).type("text/plain").send("not found");
+  });
+
   // ------------------------------------------------------------- errors ---
   // Structured, redacted error handling. Never logs request bodies, headers,
   // secrets or stack traces; never returns internal detail to the client.
@@ -473,16 +635,43 @@ function createApp(config = readConfig()) {
   return app;
 }
 
-const app = createApp();
+// Build the app. A misconfigured environment must produce a clear, single-line
+// diagnostic and a non-zero exit instead of an unhandled exception when the
+// process is started directly; a library/test require still throws as before.
+let app;
+try {
+  app = createApp();
+} catch (err) {
+  if (require.main === module) {
+    console.error(`[server] startup failed: ${(err && err.message) || err}`);
+    process.exit(1);
+  }
+  throw err;
+}
 
 // Graceful shutdown: stop accepting connections, close the database, then exit.
 // Guarded against duplicate execution and a hard timeout so it can never hang.
-function attachShutdown(server, { timeoutMs = 10000 } = {}) {
+function attachShutdown(server, { timeoutMs = 10000, onDrain } = {}) {
   let closing = false;
   return function shutdown(signal) {
     if (closing) return;
     closing = true;
     console.log(`[server] ${signal} received — shutting down`);
+    // Mark not-ready first, so a probe-driven router drains before we close.
+    if (typeof onDrain === "function") {
+      try {
+        onDrain();
+      } catch {
+        /* draining is best-effort */
+      }
+    }
+    // Terminate in-flight PDF workers first so any pending upload fails fast
+    // instead of holding the socket open until the deadline.
+    try {
+      shutdownPdfWorkers();
+    } catch {
+      /* best-effort worker termination */
+    }
     const force = setTimeout(() => {
       console.error("[server] graceful shutdown timed out — forcing exit");
       process.exit(1);
@@ -511,11 +700,20 @@ function attachShutdown(server, { timeoutMs = 10000 } = {}) {
 }
 
 if (require.main === module) {
-  const server = app.listen(PORT, () => {
-    console.log(`Recall running at http://localhost:${PORT}`);
-    embeddings.warmup();
+  const config = readConfig();
+  const server = app.listen(config.port, config.host, async () => {
+    console.log(`Recall running at http://${config.host}:${config.port}`);
+    const loopback = ["127.0.0.1", "::1", "localhost"].includes(config.host);
+    if (!loopback) {
+      console.warn(
+        `[server] WARNING: bound to ${config.host} (reachable from other machines). ` +
+          "Ensure AUTH_MODE=required, a firewall, and TLS in front of it."
+      );
+    }
+    await embeddings.warmup();
+    app.checkEmbeddingSpace();
   });
-  const shutdown = attachShutdown(server);
+  const shutdown = attachShutdown(server, { onDrain: () => app.beginDraining() });
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
 }

@@ -17,10 +17,17 @@
     "key:revoke": "node scripts/key-cli.js revoke",
     "eval:search": "node scripts/eval-search.js",
     "eval:extract": "node scripts/eval-extract.js",
-    "eval:documents": "node scripts/eval-documents.js"
+    "eval:documents": "node scripts/eval-documents.js",
+    "eval:memory": "node scripts/eval-memory.js",
+    "embeddings:reindex": "node scripts/backfill-embeddings.js",
+    "embeddings:reset": "node scripts/reset-embeddings.js",
+    "storage:reconcile": "node scripts/reconcile-storage.js",
+    "recall": "node scripts/recall-cli.js",
+    "smoke": "node scripts/smoke.js",
+    "smoke:matrix": "node scripts/smoke-matrix.js"
   },
   "dependencies": {
-    "@xenova/transformers": "^2.17.2",
+    "@huggingface/transformers": "^4.3.1",
     "better-sqlite3": "^13.0.3",
     "express": "^4.19.2",
     "unpdf": "^1.9.0"

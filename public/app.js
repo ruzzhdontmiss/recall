@@ -1,8 +1,16 @@
+// Recall dashboard.
+//
+// Pure browser code over the public HTTP API only: every value rendered here is
+// already sanitized server-side (`publicDocument`/`publicMemory` strip embedding
+// vectors, provider/model bookkeeping and the server-side storage key), and all
+// text is HTML-escaped before insertion.
+
 const KEY_STORAGE = "recall_api_key";
 
 const apiKeyInput = document.getElementById("apiKey");
 const tagInput = document.getElementById("containerTag");
 const tagList = document.getElementById("containerTags");
+const banner = document.getElementById("banner");
 
 const contentEl = document.getElementById("content");
 const addBtn = document.getElementById("addBtn");
@@ -17,7 +25,9 @@ const staticList = document.getElementById("staticList");
 const dynamicList = document.getElementById("dynamicList");
 const staticEmpty = document.getElementById("staticEmpty");
 const dynamicEmpty = document.getElementById("dynamicEmpty");
+const memoryList = document.getElementById("memoryList");
 const docFeed = document.getElementById("docFeed");
+const docDetail = document.getElementById("docDetail");
 
 function apiKey() {
   return (apiKeyInput.value || localStorage.getItem(KEY_STORAGE) || "").trim();
@@ -42,12 +52,44 @@ async function api(path, opts = {}) {
   return body;
 }
 
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function snippet(s, n = 160) {
+  const flat = String(s || "").replace(/\s+/g, " ").trim();
+  return flat.length > n ? flat.slice(0, n) + "…" : flat;
+}
+
 function timeAgo(iso) {
   const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
   if (s < 60) return "just now";
   if (s < 3600) return Math.floor(s / 60) + "m ago";
   if (s < 86400) return Math.floor(s / 3600) + "h ago";
   return Math.floor(s / 86400) + "d ago";
+}
+
+function setBanner(kind, text) {
+  if (!text) {
+    banner.hidden = true;
+    banner.textContent = "";
+    return;
+  }
+  banner.hidden = false;
+  banner.className = `banner banner--${kind}`;
+  banner.textContent = text;
+}
+
+const containerParam = (extra = "") => {
+  const params = new URLSearchParams(extra);
+  if (tag()) params.set("containerTag", tag());
+  const s = params.toString();
+  return s ? `?${s}` : "";
+};
+
+function statusBadge(status) {
+  const cls = status === "ready" ? "ready" : status === "failed" ? "failed" : "other";
+  return `<span class="badge badge--${cls}">${escapeHtml(status)}</span>`;
 }
 
 async function refreshContainers() {
@@ -61,11 +103,10 @@ async function refreshWhoami() {
 }
 
 async function refreshProfile() {
-  const query = tag() ? `?containerTag=${encodeURIComponent(tag())}` : "";
-  const { profile } = await api(`/v1/profile${query}`);
+  const { profile } = await api(`/v1/profile${containerParam()}`);
 
   staticList.innerHTML = profile.static
-    .map((f) => `<li>${escapeHtml(f.text)}${f.slot ? `<span class="meta">${f.slot}</span>` : ""}</li>`)
+    .map((f) => `<li>${escapeHtml(f.text)}${f.slot ? `<span class="meta">${escapeHtml(f.slot)}</span>` : ""}</li>`)
     .join("");
   staticEmpty.style.display = profile.static.length ? "none" : "block";
 
@@ -78,32 +119,111 @@ async function refreshProfile() {
   dynamicEmpty.style.display = profile.dynamic.length ? "none" : "block";
 }
 
+async function refreshMemories() {
+  memoryList.innerHTML = `<li class="empty-hint">loading…</li>`;
+  const { memories } = await api(`/v1/memories${containerParam()}`);
+  if (!memories.length) {
+    memoryList.innerHTML = `<li class="empty-hint">nothing stored yet</li>`;
+    return;
+  }
+  memoryList.innerHTML = memories
+    .map((m) => {
+      const forget =
+        m.effectiveStatus === "active"
+          ? `<button class="btn btn--small forget-btn" data-id="${escapeHtml(m.id)}">forget</button>`
+          : "";
+      return `<li><span class="badge badge--${m.effectiveStatus === "active" ? "ready" : "other"}">${escapeHtml(
+        m.effectiveStatus
+      )}</span><span class="meta-inline">${escapeHtml(snippet(m.text))}</span>${forget}</li>`;
+    })
+    .join("");
+  memoryList.querySelectorAll(".forget-btn").forEach((btn) => {
+    btn.addEventListener("click", () => forgetMemory(btn.dataset.id));
+  });
+}
+
+async function forgetMemory(id) {
+  if (
+    !window.confirm(
+      "Forget this extracted memory? It will disappear from the profile and memory search. " +
+        "The original note you added is kept as its source and stays searchable — delete the " +
+        "source document to remove it entirely."
+    )
+  ) {
+    return;
+  }
+  try {
+    await api(`/v1/memories/${encodeURIComponent(id)}${containerParam()}`, { method: "DELETE" });
+    await refreshAll();
+  } catch (e) {
+    setBanner("error", `could not forget memory: ${e.message}`);
+  }
+}
+
 async function refreshDocs() {
-  const query = tag() ? `?containerTag=${encodeURIComponent(tag())}` : "";
-  const { documents } = await api(`/v1/documents${query}`);
+  docFeed.innerHTML = `<li class="empty-hint">loading…</li>`;
+  const { documents } = await api(`/v1/documents${containerParam()}`);
   if (!documents.length) {
     docFeed.innerHTML = `<li class="empty-hint">nothing captured yet in this space</li>`;
     return;
   }
   docFeed.innerHTML = documents
-    .slice(0, 8)
-    .map(
-      (d) =>
-        `<li>${escapeHtml(d.content)}<span class="doc-time">${timeAgo(d.createdAt)}</span></li>`
-    )
+    .slice(0, 12)
+    .map((d) => {
+      const label = d.filename ? escapeHtml(d.filename) : escapeHtml(snippet(d.content, 80));
+      const err = d.status === "failed" && d.errorCode ? `<span class="doc-time">${escapeHtml(d.errorCode)}</span>` : "";
+      return (
+        `<li class="doc-item" data-id="${escapeHtml(d.id)}">` +
+        `<div class="doc-head">${statusBadge(d.status)}<span class="doc-label">${label}</span>` +
+        `<span class="doc-time">${timeAgo(d.createdAt)}</span></div>` +
+        `<span class="doc-meta">chunks ${d.chunkCount}${d.pageCount ? ` · pages ${d.pageCount}` : ""}</span>${err}</li>`
+      );
+    })
     .join("");
+  docFeed.querySelectorAll(".doc-item").forEach((li) => {
+    li.addEventListener("click", () => showDocument(li.dataset.id));
+  });
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+async function showDocument(id) {
+  docDetail.hidden = false;
+  docDetail.innerHTML = `<p class="empty-hint">loading…</p>`;
+  try {
+    const { document: doc, chunks } = await api(`/v1/documents/${encodeURIComponent(id)}${containerParam()}`);
+    const head =
+      `<div class="doc-head">${statusBadge(doc.status)}<span class="doc-label">${escapeHtml(
+        doc.filename || snippet(doc.content, 60)
+      )}</span><button class="btn btn--small" id="docClose">close</button></div>` +
+      (doc.errorCode ? `<p class="pane-sub">failed: ${escapeHtml(doc.errorCode)}</p>` : "");
+    const body = chunks.length
+      ? chunks
+          .map(
+            (c) =>
+              `<li><span class="meta">#${c.chunkIndex}${c.page ? ` · page ${c.page}` : ""}</span>${escapeHtml(
+                snippet(c.text, 240)
+              )}</li>`
+          )
+          .join("")
+      : `<li class="empty-hint">no searchable passages (failed or incomplete ingestion)</li>`;
+    docDetail.innerHTML = head + `<ul class="chunk-list">${body}</ul>`;
+    document.getElementById("docClose").addEventListener("click", () => {
+      docDetail.hidden = true;
+      docDetail.innerHTML = "";
+    });
+  } catch (e) {
+    docDetail.innerHTML = `<p class="empty-hint">error: ${escapeHtml(e.message)}</p>`;
+  }
 }
 
 async function refreshAll() {
+  setBanner("", "");
   try {
-    await Promise.all([refreshWhoami(), refreshContainers(), refreshProfile(), refreshDocs()]);
+    await Promise.all([refreshWhoami(), refreshContainers(), refreshProfile(), refreshMemories(), refreshDocs()]);
   } catch (e) {
     if (e.status === 401) {
-      addStatus.textContent = "enter a valid API key to continue";
+      setBanner("info", "enter a valid API key to continue");
+    } else {
+      setBanner("error", `could not load this space: ${e.message}`);
     }
   }
 }
@@ -135,21 +255,39 @@ addBtn.addEventListener("click", async () => {
 async function runSearch() {
   const q = searchInput.value.trim();
   if (!q) return;
-  const t = tag() ? `&containerTag=${encodeURIComponent(tag())}` : "";
+  searchResults.innerHTML = `<li class="empty-hint">searching…</li>`;
   try {
-    const { results } = await api(
-      `/v1/search?q=${encodeURIComponent(q)}${t}&searchMode=${searchMode.value}`
+    const { results, ranking, embeddingsProvider } = await api(
+      `/v1/search${containerParam({ q, searchMode: searchMode.value })}`
     );
+    // Be honest about how the results were ranked: never present a lexical
+    // fallback as semantic search.
+    const note =
+      ranking === "dense"
+        ? ""
+        : `<li class="empty-hint">ranked lexically${
+            embeddingsProvider === "uninitialized"
+              ? " — the embedding provider is unavailable"
+              : ""
+          }; matching is keyword-based, not semantic</li>`;
     if (!results.length) {
-      searchResults.innerHTML = `<li class="empty-hint">no matches — try different wording, or add more memories first</li>`;
+      searchResults.innerHTML =
+        note + `<li class="empty-hint">no matches — try different wording, or add more memories first</li>`;
       return;
     }
-    searchResults.innerHTML = results
-      .map(
-        (r) =>
-          `<li><span class="result-tag result-tag--${r.source}">${r.source}</span><span class="result-score">${r.score}</span>${escapeHtml(r.text)}</li>`
-      )
-      .join("");
+    searchResults.innerHTML =
+      note +
+      results
+        .map((r) => {
+          const where =
+            r.source === "chunk"
+              ? `<span class="meta-inline">${escapeHtml(r.filename || "document")}${r.page ? ` · page ${r.page}` : ""}</span>`
+              : "";
+          return `<li><span class="result-tag result-tag--${escapeHtml(r.source)}">${escapeHtml(
+            r.source
+          )}</span><span class="result-score">${r.score}</span>${escapeHtml(snippet(r.text))}${where}</li>`;
+        })
+        .join("");
   } catch (e) {
     searchResults.innerHTML = `<li class="empty-hint">error: ${escapeHtml(e.message)}</li>`;
   }

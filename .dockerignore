@@ -1,0 +1,15 @@
+# Keep the build context small and free of secrets/data. The runtime image is
+# assembled from explicit COPYs, so this mainly trims the context.
+.git
+.github
+node_modules
+data
+test
+coverage
+*.md
+RECALL_DEPLOYMENT_PLAN.md
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store

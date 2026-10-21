@@ -48,7 +48,8 @@ mechanics end-to-end in readable code so they can be studied, extended, and self
 ## Architecture
 
 ```
-server.js                 Express app: routes, auth, tenant isolation, limits, shutdown
+server.js                 Express app: routes, auth, tenant isolation, limits, health, shutdown
+lib/config.js             env reading + fail-fast validation (server + document limits)
 lib/auth.js               API-key issuance/hashing, auth middleware, container authorization
 lib/validate.js           request / identifier / container / payload-size validation
 lib/ratelimit.js          in-memory per-key rate limiter
@@ -58,15 +59,16 @@ lib/storage/sqlite.js     SQLite backend (better-sqlite3, WAL, transactions, ind
 lib/storage/json.js       legacy JSON backend (kept for rollback)
 lib/storage/migrations/   explicit SQL schema migrations (001 storage, 002 auth, 003 documents)
 lib/storage/vectors.js    embedding encode/decode + validation
-lib/documents/            upload pipeline: storage, extract (txt/md/pdf), chunk, ingest
+lib/documents/            upload pipeline: storage, extract (txt/md/pdf), pdf-worker, chunk, ingest
 lib/extract.js            orchestrates LLM vs regex; applies slot/TTL mechanics
 lib/extract/              openai / anthropic / gemini structured extractors + regex
 lib/embeddings/           xenova (default) / openai / gemini / tfidf
 lib/search.js             hybrid ranking over stored vectors
 lib/tfidf.js              TF-IDF fallback scorer
 public/                   vanilla HTML/CSS/JS dashboard (API-key field + authenticated calls)
-scripts/                  key CLI, JSON→SQLite migration, and evaluation scripts
+scripts/                  key CLI, migrations, evaluation scripts, smoke test + matrix
 test/                     node:test regression suite
+Dockerfile / docker-compose.yml / .github/workflows/ci.yml   deployment + CI
 ```
 
 ## How a memory flows through Recall
@@ -92,8 +94,10 @@ searchable at passage granularity:
    page count, extracted length and chunk count are all bounded. Anything else is rejected.
 2. **Deduplicate** — the SHA-256 of the bytes identifies an identical, already-processed upload
    in the same container; it returns the existing document and creates no new chunks.
-3. **Extract** — text is pulled per page for PDFs (via `unpdf`) and normalized; parsing has a
-   wall-clock timeout and a page cap.
+3. **Extract** — text is pulled per page for PDFs and normalized. PDF parsing runs in a
+   dedicated **worker thread**, never in the main server process: each job has a wall-clock
+   deadline (the thread is terminated when it expires), the number of concurrent parsers and
+   the queue behind them are bounded, and a parser crash or timeout fails only that upload.
 4. **Chunk** — text is split into overlapping passages (paragraph/sentence-aware) with character
    offsets and, for PDFs, the page number.
 5. **Embed** — chunks are embedded in batches when a dense provider is configured; embedding is
@@ -131,12 +135,20 @@ downloaded and cached. After that, search is local and key-free.
 
 ## Configuration
 
-Copy `.env.example` to `.env` (never commit it) and adjust. Everything has a working
-default; the variables below are the full surface.
+Configuration is read from the **process environment**. For a direct install, export the
+variables, or start with `node --env-file=.env server.js` (Node 22.9+) — `npm start` does
+not read `.env` by itself. `docker compose` **does** read `.env`; copy `.env.example` to
+`.env` (never commit it) and adjust. Everything has a working default; the variables below
+are the full surface. Values are validated at startup: an explicitly-set invalid value (a
+bad port, a wildcard CORS origin, a non-numeric limit, a `HOST` containing a scheme or
+path) makes the process exit non-zero with a clear message rather than silently falling
+back.
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `PORT` | `6767` | HTTP port. |
+| `HOST` | `127.0.0.1` | Bind address. Loopback by default; set `0.0.0.0` only behind TLS/firewall with `AUTH_MODE=required`. |
+| `NODE_ENV` | *(unset)* | Set to `production` in production. Also makes `AUTH_MODE=dev` a startup error. |
 | `DATA_DIR` | `./data` | Base directory for the database. |
 | `STORAGE_BACKEND` | `sqlite` | `sqlite` (default) or `json` (legacy/rollback). |
 | `SQLITE_FILE` / `STORE_FILE` | `data/recall.db` / `data/store.json` | Explicit file paths. |
@@ -147,13 +159,20 @@ default; the variables below are the full surface.
 | `CORS_ORIGINS` | *(off)* | Explicit comma-separated allowlist. Never a wildcard. |
 | `EMBEDDINGS_PROVIDER` | `xenova` | `xenova` \| `openai` \| `gemini` \| `tfidf`. |
 | `EMBEDDINGS_MODEL` | provider default | Override the embedding model id. |
+| `EMBEDDINGS_DTYPE` | `q8` | Local precision. Changing it changes the vector space (stale vectors are re-embedded on access; run `npm run embeddings:reindex`). |
+| `EMBEDDINGS_CACHE_DIR` | *(inside `node_modules`)* | Durable model cache directory (survives `npm ci`). |
+| `EMBEDDINGS_LOCAL_MODEL_PATH` | *(unset)* | Load models from a local directory (offline installs). |
+| `EMBEDDINGS_OFFLINE` | `false` | Never fetch models from the network. |
 | `EXTRACTION_PROVIDER` | `auto` | `auto` \| `openai` \| `anthropic` \| `gemini` \| `regex`. |
 | `EXTRACTION_MODEL` | provider default | Override the extraction model id. |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY` | *(empty)* | Provider credentials. |
 | `UPLOAD_DIR` | `DATA_DIR/uploads` | Private directory for uploaded files (dirs `0700`, files `0600`). |
 | `MAX_UPLOAD_BYTES` | `10485760` (10 MiB) | Hard cap on a single uploaded file. |
 | `MAX_PDF_PAGES` | `500` | Reject PDFs with more pages. |
-| `PDF_EXTRACT_TIMEOUT_MS` | `20000` | Wall-clock bound on PDF parsing. |
+| `PDF_EXTRACT_TIMEOUT_MS` | `20000` | Wall-clock bound on PDF parsing; the worker thread is terminated when exceeded. |
+| `PDF_MAX_CONCURRENT` | `2` | PDFs parsed at once (one worker thread each). |
+| `PDF_MAX_QUEUE` | `64` | Uploads that may wait for a PDF worker slot before the API returns `503` (`pdf_busy`). |
+| `PDF_WORKER_HEAP_MB` | `0` | Per-worker V8 old-space cap in MiB (`0` = Node default). |
 | `MAX_EXTRACTED_CHARS` | `2000000` | Reject documents that extract more text than this. |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `1200` / `200` | Chunking window and overlap (characters). |
 | `MAX_CHUNKS` | `2000` | Reject documents that produce more chunks. |
@@ -171,6 +190,40 @@ npm run key:create -- --tenant alice --container demo_user --name "alice laptop"
 # Existing-data migration: adopt a pre-existing container tag.
 #   e.g. if your old tags were user_123 / demo_user, create keys with those --container values.
 ```
+
+### Command-line client
+
+`npm run recall` is a small client for a **running** server (local or private remote). It uses
+`RECALL_URL` (default `http://127.0.0.1:6767`) and `RECALL_API_KEY`, or `--url` / `--key`:
+
+```bash
+export RECALL_URL=http://127.0.0.1:6767
+export RECALL_API_KEY=sm_…
+
+npm run recall -- whoami
+npm run recall -- add "I'm a backend engineer in Berlin."
+npm run recall -- search "where does this person work" --mode hybrid
+npm run recall -- memories
+npm run recall -- upload ./notes.pdf
+npm run recall -- documents
+npm run recall -- document <id>        # status, filename and source passages
+npm run recall -- delete <id> --yes    # destructive: --yes is required
+npm run recall -- forget <memoryId> --yes   # hides the fact; the source document is kept
+```
+
+Every command accepts `--container <tag>` (default: the key's container) and `--json`. A failed
+operation — invalid input, an HTTP error, or a **failed ingestion** — exits non-zero;
+destructive commands without `--yes` exit `2` and change nothing.
+
+### Browser dashboard
+
+Serving `/` (the private, same-origin dashboard) lets you add memories, search, inspect the
+profile, list/forget memories and click any document to see its source passages. Forgetting a
+memory hides that extracted fact from the profile and from `searchMode=memories`, but keeps the
+source note (so you can still inspect where it came from); delete the source document to remove
+the content itself. Enter your API key in the header (kept only in this browser's
+`localStorage`); the dashboard talks exclusively to the public `/v1` API, so embedding vectors,
+provider/model bookkeeping and server-side paths never reach the browser.
 
 ## Authentication and multi-tenancy
 
@@ -236,6 +289,32 @@ from other origins, set an explicit allowlist — never a wildcard:
 CORS_ORIGINS=https://app.example.com,https://admin.example.com npm start
 ```
 
+### Network exposure
+
+Recall binds to **`127.0.0.1` by default**, so a fresh install is not reachable from another
+machine until you deliberately set `HOST=0.0.0.0` (or a specific interface). If you bind to a
+non-loopback address the server logs a warning to that effect. Before exposing it:
+
+1. Keep `AUTH_MODE=required` (the server refuses `dev` when `NODE_ENV=production`).
+2. Put TLS in front (a reverse proxy) — Recall speaks plain HTTP.
+3. Restrict reachability with a firewall or private network; never publish it directly.
+
+Defence-in-depth that is always on:
+
+- **Every `/v1` route requires a bearer key**; the dashboard page itself holds no data and no
+  secrets (it prompts for a key, kept only in the browser's `localStorage`).
+- **Strict browser headers** on every response: a self-only `Content-Security-Policy` (the
+  dashboard ships no third-party fonts, scripts or CDNs), `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
+  `Cross-Origin-Opener-Policy`/`-Resource-Policy: same-origin`, and a locked-down
+  `Permissions-Policy`. `X-Powered-By` is disabled.
+- **CSRF does not apply**: authentication is a bearer token in a header (no cookies, no ambient
+  credentials), so a cross-site form cannot authenticate a state-changing request.
+- **Uploads are validated by magic bytes** and stored under server-generated names — the client
+  filename is metadata only, so path traversal is impossible.
+- **Errors are generic and redacted** — no stack traces, paths or secrets reach the client, and
+  request bodies/headers are never logged.
+
 ## API
 
 All endpoints require `Authorization: Bearer <key>`. `containerTag` is an optional selector
@@ -250,6 +329,9 @@ curl -X POST localhost:6767/v1/add -H "Authorization: Bearer $KEY" -H "Content-T
   -d '{"content":"I am a backend engineer. I live in Berlin. I prefer Rust over Go.","containerTag":"user_123"}'
 
 # Hybrid search (memories + documents). searchMode: hybrid | memories | documents
+# -> { results, searchMode, containerTag, embeddingsProvider, ranking }
+#    `ranking` is "dense" | "lexical" | "none" — it reports how THIS response was
+#    actually ranked, so a lexical fallback is never reported as semantic search.
 curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/search?q=where+does+the+user+live&containerTag=user_123&searchMode=hybrid"
 
 # User profile: static (durable) + dynamic (temporary) facts
@@ -300,9 +382,11 @@ bodies are generic (`{"error":"..."}`) and never leak secrets, absolute paths or
 
 - **Supported now:** `.txt`, `.md`, `.pdf` (text extraction; no OCR). Word/audio/code and
   scanned/image-only PDFs are out of scope for this phase.
-- **Synchronous pipeline.** Uploads are processed in the request; there is no queue. Small and
-  medium files are fine, but a very large PDF holds the request open (bounded by
-  `PDF_EXTRACT_TIMEOUT_MS`).
+- **Synchronous pipeline, isolated parser.** Uploads are processed in the request; there is no
+  queue. PDF parsing runs in a bounded pool of worker threads (`PDF_MAX_CONCURRENT` active,
+  `PDF_MAX_QUEUE` waiting) so it can never run unbounded in the server. A job that exceeds
+  `PDF_EXTRACT_TIMEOUT_MS` is terminated and fails with `pdf_timeout`; when the wait queue is
+  full the API returns `503` (`pdf_busy`) rather than buffering without bound.
 - **Private storage.** Files are written under `UPLOAD_DIR` with server-generated names
   (`<uuid>.<ext>`) and `0600` permissions. The client's filename is stored as metadata only and
   is never used to build a path — path traversal is not possible.
@@ -310,7 +394,14 @@ bodies are generic (`{"error":"..."}`) and never leak secrets, absolute paths or
   bytes creates a *new* document whose `previousDocumentId` points at the prior version; both
   are retained and searchable until you delete one.
 - **Failed uploads** are recorded with `status:"failed"` and an `errorCode` (e.g.
-  `pdf_unreadable`), create no chunks, leave no file, and never block a later retry.
+  `pdf_unreadable`), create no chunks, leave no file, and never block a later retry. A PDF that
+  times out, crashes the parser, or is rejected by a limit is recorded the same way and is never
+  exposed as searchable.
+- **Bounds that are best-effort.** `PDF_EXTRACT_TIMEOUT_MS` terminates the worker thread, but a
+  hard memory limit inside a PDF parser cannot be fully enforced by `PDF_WORKER_HEAP_MB` alone
+  (a worker can also be killed externally, e.g. by the OS OOM killer); such a job fails cleanly
+  rather than corrupting state. Deadline enforcement is wall-clock, so a machine under heavy
+  load may terminate a job that would otherwise have finished.
 - **Retrieval without embeddings.** When the embedding provider is lexical, or chunk embedding
   fails, chunk ranking falls back to TF-IDF so uploaded content stays searchable.
 
@@ -391,21 +482,111 @@ printed.
 - The JSON store is never removed automatically; delete it yourself only after you are
   satisfied the SQLite data is correct.
 
+### Reconcile files with records
+
+Uploaded files live on disk under `UPLOAD_DIR` while their records live in the database, so a
+crash between the two, an interrupted delete, or a manual file copy can leave them out of step.
+`storage:reconcile` reports both directions and (only with `--apply`) deletes files that no
+record references:
+
+```bash
+npm run storage:reconcile                 # dry run: report only
+npm run storage:reconcile -- --apply      # delete orphaned files
+npm run storage:reconcile -- --json       # machine-readable report
+```
+
+Safety properties:
+
+- **Records are never modified.** Only unreferenced *files* are deleted; a record whose file is
+  missing is reported and left untouched so provenance is preserved.
+- **A grace period (default 1 hour)** protects files newer than the window, so a concurrent
+  upload that has committed its file but not yet inserted its row is never mistaken for an
+  orphan. Override with `--grace-ms <n>` or `STORAGE_RECONCILE_GRACE_MS`.
+- **Transient filesystem errors are not proof.** A file or directory that cannot be read is
+  reported and skipped, never deleted.
+- **Idempotent**, works on both backends, skips `UPLOAD_DIR/tmp`, and exits non-zero if a delete
+  fails or the directory cannot be read. Stop the server first for the most accurate result.
+
+### Embedding-space rollback
+
+Restoring the previous **code and dependencies** is *not* sufficient on its own. The previous
+embedding stack reused any non-empty stored vector, so once a reindex has written new-space
+vectors (the old and new local spaces have the same dimension), the restored stack would score
+those vectors against its own — silently mixing two spaces.
+
+To roll back the embedding stack safely, invalidate the stored vectors first so the restored
+stack regenerates them:
+
+```bash
+# 1. Stop the server.
+# 2. Preview what would be cleared (writes nothing):
+npm run embeddings:reset -- --dry-run
+
+# 3. Clear every stored vector and the recorded space identity:
+npm run embeddings:reset -- --apply
+
+# 4. Now restore the previous code and dependencies, then start.
+```
+
+`embeddings:reset` preserves all documents, memories and chunks (text, provenance and records)
+and clears only the vector fields plus the `embedding_space` bookkeeping. It works for both
+`STORAGE_BACKEND=sqlite` and `STORAGE_BACKEND=json`. Run it while the newer code is still
+checked out (before `git checkout` / `npm ci`), because the older checkout does not ship this
+command. After the reset, the restored stack re-embeds vectors lazily on access (the older
+stack has no bulk reindex command).
+
 ## Embeddings
 
 Set `EMBEDDINGS_PROVIDER` to choose how vectors are produced:
 
 | Value | What it uses | Keys |
 |---|---|---|
-| `xenova` (default) | `@xenova/transformers` + `Xenova/bge-base-en-v1.5` | none |
+| `xenova` (default) | `@huggingface/transformers` + `Xenova/bge-base-en-v1.5` (`q8`) | none |
 | `openai` | `text-embedding-3-small` | `OPENAI_API_KEY` |
 | `gemini` | `text-embedding-004` | `GEMINI_API_KEY` or `GOOGLE_API_KEY` |
 | `tfidf` | lexical TF-IDF (fallback path) | none |
 
 Optional: `EMBEDDINGS_MODEL` overrides the model id for the selected provider.
 
-If the local Xenova model fails to load and you have not opted into a cloud provider, search
-falls back to TF-IDF and the server logs that clearly.
+**Vector-space identity.** Every stored vector records the provider, model and precision that
+produced it. Before a stored vector is scored, it is checked against the current space; a vector
+from a different space is re-embedded first, so a single query never compares vectors from two
+spaces. For the local provider the identity also encodes the installed
+`@huggingface/transformers` and `onnxruntime-node` versions (for example
+`Xenova/bge-base-en-v1.5@q8~r2+tf4.3.1+ort1.30.0`), because a runtime bump can change the
+numbers for identical text — so a caret dependency upgrade is detected automatically rather than
+silently reusing old vectors. At startup the server compares the recorded space with the active
+one and warns when they differ, then re-embeds stale vectors lazily on access. A store that
+already holds vectors but records no space (a pre-Phase-A store, or one whose reindex never
+completed) is reported as a **legacy/unknown** space and the space is deliberately left
+unrecorded, so the warning keeps firing until a verified reindex records it; the space is only
+recorded automatically for a store that is genuinely empty of vectors, and only once a provider
+has actually loaded. For a controlled, whole-corpus pass (recommended after a precision change or
+a local-stack upgrade):
+
+```bash
+npm run embeddings:reindex            # dry run: report what would change
+npm run embeddings:reindex -- --apply # re-embed, then record the new space
+```
+
+If a stale vector cannot be re-embedded (provider error, or an empty/falsy response), that row is
+never compared against a foreign vector. Ranking is **all-or-nothing**: if any row in a result set
+cannot be placed in the current space — or the provider cannot load at all — the whole set is
+ranked lexically (TF-IDF), so content is never silently dropped and two spaces are never mixed in
+one response. A failed reindex never records the space, so the next startup keeps warning until it
+is complete.
+
+Every search response carries an authoritative `ranking` field (`dense` | `lexical` | `none`)
+describing how *that* response was actually ranked, so a degraded/lexical result can never be
+mistaken for semantic search; `embeddingsProvider` separately names the loaded provider. A provider
+that cannot load degrades search to lexical with HTTP `200` (it does not fail the request).
+
+**Hosted providers** (`openai`, `gemini`) record the configured model id only. If a provider
+changes its server-side model behaviour without changing the id, Recall cannot detect it and the
+space is treated as unchanged.
+
+If the local model fails to load and you have not opted into a cloud provider, search falls back
+to TF-IDF and the server logs that clearly.
 
 ```bash
 # faster iteration while developing (needs a key)
@@ -442,11 +623,64 @@ npm test                      # storage, migration, API, auth/isolation, documen
 npm run eval:search           # paraphrase retrieval check (downloads the local model on first run)
 npm run eval:extract          # regex-gap + structured-schema check (live LLM skipped without a key)
 npm run eval:documents        # end-to-end txt/md/pdf ingestion, attribution, dedupe, scoping, delete
+npm run eval:memory           # 44-question retrieval set: top-1, Recall@5, stale/conflict, provenance
 ```
+
+`eval:memory` ingests synthetic facts and a multi-chunk document through the real HTTP API,
+then measures retrieval. `--strict` enforces the fixture thresholds and fails on stale hits
+(CI runs it this way). It also probes questions with no answer, reports the response's real
+`ranking` mode, and verifies that deleting a document removes its chunks and stored file.
 
 Tests use Node's built-in runner with temporary directories and never touch the real store.
 They run with `EMBEDDINGS_PROVIDER=tfidf` and `EXTRACTION_PROVIDER=regex` for speed and
 determinism; live model/LLM paths are exercised separately by the eval scripts.
+
+### Smoke test against a running instance
+
+The suite above drives the app in-process. To check a *deployed* instance — a local
+`npm start` or the container — run the smoke test against its URL:
+
+```bash
+# dev-mode instance (no key needed)
+RECALL_URL=http://127.0.0.1:6767 npm run smoke
+# authenticated instance
+RECALL_URL=http://127.0.0.1:6767 RECALL_KEY=sm_… npm run smoke
+```
+
+It checks liveness/readiness, authentication, ingest → search → profile, a file upload with
+attribution and dedupe, deletion, and that a lexical provider is never reported as dense. It
+cleans up everything it creates and exits non-zero on the first failure.
+
+To exercise the supported configurations end to end (and prove the default bind is not
+reachable from a non-loopback address), run the matrix — it starts a real server per scenario:
+
+```bash
+npm run smoke:matrix              # sqlite/json, tfidf/dense/degraded, dev/authenticated
+SMOKE_SKIP_DENSE=1 npm run smoke:matrix   # skip the scenarios that load the local model
+```
+
+### Runtime and platform
+
+- **Node ≥ 22.** Declared in `package.json` (`engines`) and pinned by `.nvmrc` (`22`); `.npmrc`
+  sets `engine-strict=true` so an unsupported Node fails the install instead of producing a tree
+  that will not run.
+- **Reproducible installs.** Dependencies resolve from `package-lock.json`; use `npm ci` (never
+  `npm install` in deployment). A clean `npm ci` from the committed lockfile installs the full
+  tree with **0 audit vulnerabilities** and the whole suite passes.
+- **Native modules.** Local embeddings run on `onnxruntime-node` and `sharp`, which ship prebuilt
+  platform binaries. `npm ls` shows a few `extraneous` / `UNMET OPTIONAL DEPENDENCY` entries for
+  *other* platforms (Windows, Linux/musl variants) — this is expected npm behaviour for optional
+  platform packages and `npm ci` reproduces it exactly; it is not a broken tree.
+- **Model cache.** `EMBEDDINGS_CACHE_DIR` defaults inside `node_modules`, so a container must
+  mount a persistent volume for it (or point it elsewhere) to avoid re-downloading the model on
+  every start.
+- **Cross-platform.** Verified on macOS (darwin-arm64) and in the Linux image on both
+  `linux/amd64` and `linux/arm64` (Node 22): build from the committed lockfile, the full suite,
+  native ONNX inference returning `ranking: "dense"` (the `onnxruntime-node` shared library is
+  confirmed mapped in the process), database/uploads persistence across a restart, graceful
+  `SIGTERM` (exit 0), non-root execution, and loopback-only publishing. The `container` CI job
+  repeats the build and runtime checks on `ubuntu-latest`.
+
 
 The document suite (`test/documents.test.js`, `test/rank-chunks.test.js`) covers happy-path
 txt/md/pdf ingestion with page/chunk attribution, every rejection path (empty, unsupported,
@@ -463,6 +697,115 @@ validation, the dev-mode production guard, the CLI bootstrap/revocation workflow
 isolation after reopening the database. `test/auth-race.test.js` and a data-layer test cover
 the container-claim race (see [Limitations](#limitations)).
 
+## Operations and deployment
+
+Recall is designed for a **private, single-instance** deployment. It ships a minimal
+production container plus the pieces an operator needs to run it safely.
+
+### Health and readiness
+
+Two unauthenticated endpoints (a probe cannot hold an API key) expose coarse,
+non-secret status only — never paths, content or tenants:
+
+```bash
+curl localhost:6767/healthz   # liveness: 200 while the process serves HTTP
+curl localhost:6767/readyz    # readiness: 200 when serviceable, 503 otherwise
+```
+
+`/readyz` reports each dependency and answers `503` while **draining** or when the
+**database or upload storage is unusable**. Embeddings are reported but are
+deliberately *not* a readiness gate: an unavailable provider degrades to lexical
+search, which still serves requests, so it must not restart-loop an otherwise
+healthy instance. A dense provider that failed to load shows up as `"degraded"`:
+
+```json
+{"status":"degraded","ready":true,"degraded":true,"draining":false,"version":"0.1.0",
+ "dependencies":{"database":{"ok":true,"backend":"sqlite"},"storage":{"ok":true},
+ "embeddings":{"ok":true,"provider":"uninitialized","configured":"openai","dense":false,
+ "space":"uninitialized"}}}
+```
+
+### Graceful shutdown
+
+On `SIGTERM`/`SIGINT` Recall flips `/readyz` to not-ready first (so a probe-driven
+router drains), stops accepting connections, terminates any in-flight PDF workers,
+sweeps temp files, closes the database, and exits `0`. A hard 10-second timeout
+guarantees the process can never hang. Run it under an init system or a container
+init (`tini`, as in the image) so signals are delivered and zombies reaped.
+
+### Container
+
+```bash
+docker build -t recall:0.1.0 .
+cp .env.example .env      # adjust; never commit it
+docker compose up --build
+```
+
+After it is up, confirm it end to end from the host: `RECALL_KEY=sm_… npm run smoke` (or open
+the dashboard at `http://127.0.0.1:6767/`).
+
+The image is `node:22` Debian slim, runs as the unprivileged `node` user, copies
+only runtime files, and installs production dependencies from the lockfile. The
+compose file publishes the port on **loopback only** and enforces
+`AUTH_MODE=required`. To expose the service, put an authenticated, TLS-enabled
+reverse proxy in front; never publish it directly.
+
+Inside the container the process binds `0.0.0.0` (Docker cannot forward a
+loopback-only listener), so in a container **port publishing is the security
+boundary**: keep it on `127.0.0.1`. Direct installs still default to
+`HOST=127.0.0.1`. The image deliberately does not set `UPLOAD_DIR`, so uploads
+keep deriving from `DATA_DIR`; if you override `DATA_DIR`, the files follow it
+onto the same volume instead of landing in the container's ephemeral layer.
+
+Two volumes hold state:
+
+| Volume | Mount | Contents | Backed up |
+|---|---|---|---|
+| `recall-data` | `/app/data` | SQLite database, `uploads/` | **Yes — required** |
+| `recall-cache` | `/app/.cache/transformers` | local embedding model | No (regenerates) |
+
+Set resource limits (the compose file sets memory/CPU caps) and watch disk usage on
+`recall-data`: the database grows with content and uploads are not evicted
+automatically. A full or read-only disk surfaces as `503` from `/readyz` (the
+storage probe fails) rather than as silent corruption.
+
+**Do not run more than one replica.** Correctness depends on in-process state (see
+[Limitations](#limitations)): the SQLite backend keeps an in-memory mirror and the
+rate limiter is per-process.
+
+### Backup and restore
+
+Back up the database and the upload directory together — they must be consistent as
+a set. The model cache is optional (it regenerates).
+
+```bash
+# with the service stopped
+tar czf "recall-backup-$(date +%F).tgz" -C /app data
+```
+
+Restore by extracting over `DATA_DIR` with the service stopped. The SQLite store is
+a single `recall.db` in WAL mode; a snapshot taken while the service runs must
+include `recall.db-wal`/`-shm`, or stop the service first. `npm run db:migrate-json`
+migrates a legacy JSON store, and `npm run storage:reconcile` reports files not
+referenced by any record (dry-run by default).
+
+### Logs
+
+Logs are single-line JSON events plus a few human-readable `[...]` lifecycle lines.
+They never contain API keys, request bodies, document content, or absolute storage
+paths: startup logs the database **basename** only, and request failures log only
+the method, path, status and error class.
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on Node 22 and 24 — lockfile install,
+`npm audit --audit-level=high`, the full test suite, all four evaluation suites, a
+real startup plus `/healthz`/`/readyz` check, and a container build that runs the
+image and verifies a clean `SIGTERM` exit.
+
+Public deployment is a separate, explicit decision; this section covers a private
+instance only.
+
 ## Limitations
 
 Recall is a single-node, self-hosted engine. Known limits, stated honestly:
@@ -475,36 +818,47 @@ Recall is a single-node, self-hosted engine. Known limits, stated honestly:
 - **Rate limiting is in-memory and per-process**, not distributed.
 - **Brute-force vector scoring.** Search ranks vectors in memory rather than using an indexed
   vector store; fine for this scale, not for millions of rows.
+- **Retrieval quality is model-bound.** On the deterministic 44-question evaluation (38
+  answerable; `npm run eval:memory`), the local `bge-base-en-v1.5` provider scores **84.2% top-1** and
+  **94.7% Recall@5**; the lexical fallback scores **73.7% / 81.6%**. Some paraphrases (for
+  example "Where is the user based?" for a stored "I now live in Lisbon.") rank outside the
+  top 5. Search returns scored candidates and does **not** apply a relevance cutoff, so a
+  client that needs "no answer" behavior should threshold on `score`. Closing these misses
+  needs a stronger reranker or hybrid scoring, not a formatting change.
+- **Contradiction resolution is slot-based.** Location, employer, role, editor, language
+  preference and "my favorite &lt;thing&gt;" are superseded when a newer value arrives; the old
+  row is retained with status `superseded` (visible in `/v1/memories`) but excluded from search
+  and the profile. Free-form notes that disagree with each other are not reconciled
+  automatically — both remain active.
 - **Document ingestion is synchronous and local-disk based.** Uploads are processed inline (no
-  queue), so a very large PDF holds the request open until `PDF_EXTRACT_TIMEOUT_MS`. Files are
-  kept on the server's local disk under `UPLOAD_DIR` (not object storage) and must be backed up
-  together with the database. Text extraction only: scanned/image-only PDFs and non-text formats
-  (Word, audio, code) are not supported, and there is no OCR.
+  queue). PDF parsing is isolated in worker threads whose concurrency and queue are bounded
+  (`PDF_MAX_CONCURRENT` / `PDF_MAX_QUEUE`), and each job is terminated once it exceeds
+  `PDF_EXTRACT_TIMEOUT_MS`. Files are kept on the server's local disk under `UPLOAD_DIR` (not
+  object storage) and must be backed up together with the database. Text extraction only:
+  scanned/image-only PDFs and non-text formats (Word, audio, code) are not supported, and there
+  is no OCR.
 - **Local/offline trust model.** Authentication and tenant isolation are enforced, but the app
   is intended to run on a trusted host behind your own network controls. Serve it over TLS and
   keep it off the public internet unless you have deliberately reviewed the deployment.
-- **`npm audit` dependencies.** Five advisories (4 high, 1 critical) are reported, all
-  transitive through `@xenova/transformers@2.17.2` (the latest published `@xenova` release):
-  - `sharp@0.32.6` (high) — image codec (libvips/libheif/librsvg) issues. The text-only
-    embedding path never exercises `sharp`.
-  - `protobufjs@6.11.6` via `onnxruntime-web@1.14.0` → `onnx-proto@4.0.4` (critical) — protobuf
-    code-generation/DoS issues reachable when deserializing ONNX model protobufs. This app only
-    loads the trusted `Xenova/bge-base-en-v1.5` model; do not point `EMBEDDINGS_MODEL` at an
-    untrusted model.
+- **`npm audit` dependencies.** Clean: `npm audit` reports **0 vulnerabilities** against the
+  installed tree. Embeddings run on `@huggingface/transformers@4.3.1` (Apache-2.0), whose Node
+  runtime is `onnxruntime-node@1.30.0` + `onnxruntime-common@1.30.0` and `sharp@0.35.5`.
+  `onnxruntime-web@1.31.0-dev.<sha>` (a pinned prerelease) and its `protobufjs@7.6.6` are
+  installed as transitive dependencies but are **never executed on Node** — the Node build
+  imports `onnxruntime-node`/`onnxruntime-common`, not the web runtime — and they carry no
+  advisories. The previous `@xenova/transformers@2.17.2` tree (5 advisories: 4 high, 1 critical,
+  via `protobufjs@6` / `onnx-proto` / `sharp@0.32`) has been removed entirely.
 
-  There is **no non-breaking fix**: `npm audit fix --force` would downgrade
-  `@xenova/transformers` to `1.4.2` (older and worse) or requires overriding `protobufjs@6`
-  with `8.x` / `sharp` across a major version that `onnx-proto` and the native binaries do not
-  support. The clean path is to migrate embeddings to `@huggingface/transformers` (the
-  maintained successor, with newer `onnxruntime`/`sharp`). Until then these are documented, not
-  silently ignored.
+  Because the ONNX runtime changed (1.14.0 → 1.30.0), int8 inference numerics changed, so the
+  stored vector space changed. Existing vectors are **not** reused: they are detected as stale
+  and re-embedded (lazily on access, or in bulk with `npm run embeddings:reindex -- --apply`).
 
 ## Roadmap
 
 Product-oriented next steps, roughly in order:
 
-- **Migrate embeddings to `@huggingface/transformers`** — clears the transitive `npm audit`
-  advisories and tracks the maintained runtime.
+- **Migrate embeddings to `@huggingface/transformers`** — *done in Phase A*: clears the
+  transitive `npm audit` advisories and tracks the maintained runtime (see the note above).
 - **Indexed vector search** — move scoring out of memory (e.g. `sqlite-vec` or an external
   vector store) behind the existing `lib/storage` facade.
 - **File ingestion** — shipped for `.txt` / `.md` / `.pdf` (upload → extract → chunk → embed →
@@ -517,6 +871,12 @@ Product-oriented next steps, roughly in order:
 ## Status
 
 Functional and tested for the described scope: ingestion (raw text and `.txt`/`.md`/`.pdf`
-uploads), extraction, persistence, retrieval, authentication and tenant isolation. It is a
-focused engineering project, **not** a production-hardened, horizontally-scaled service — see
-[Limitations](#limitations) before exposing it.
+uploads), extraction, persistence, retrieval, authentication and tenant isolation. It is
+operationally ready for a **private, single-instance** deployment: liveness/readiness
+endpoints, draining-aware graceful shutdown, fail-fast configuration validation, a minimal
+non-root container, a smoke matrix and CI. Realistic memory workflows (updates, conflicts,
+document provenance, deletion, restart persistence, provider failure) and a deterministic
+44-question retrieval evaluation are part of the suite. Search reports how it actually ranked
+(`ranking`: `dense` | `lexical` | `none`) so a degraded fallback is never presented as semantic
+search. It is a focused engineering project, **not** a production-hardened, horizontally-scaled
+service — see [Limitations](#limitations) before exposing it.

@@ -90,6 +90,34 @@ test("contradiction supersedes the previous fact", async () => {
   assert.ok(all.body.memories.some((m) => m.effectiveStatus === "superseded"));
 });
 
+test("forget hides the extracted fact but keeps its source note", async () => {
+  const added = await postAdd("I own a yellow kayak.", "api_forget");
+  assert.equal(added.status, 200);
+  const memory = added.body.memories[0];
+  assert.ok(memory && memory.id, "the add must produce a memory");
+
+  const del = await json(`/v1/memories/${memory.id}?containerTag=api_forget`, { method: "DELETE" });
+  assert.equal(del.status, 200);
+
+  const all = await json("/v1/memories?containerTag=api_forget");
+  const stored = all.body.memories.find((m) => m.id === memory.id);
+  assert.equal(stored.effectiveStatus, "forgotten");
+
+  // Memory search and the profile no longer present the fact.
+  const memSearch = await json(
+    "/v1/search?searchMode=memories&q=yellow+kayak&containerTag=api_forget"
+  );
+  assert.ok(!memSearch.body.results.some((r) => r.id === memory.id));
+
+  // The source note is deliberately retained (see README): hybrid search can
+  // still surface it, and deleting the document is the way to remove it.
+  const hybrid = await json("/v1/search?q=yellow+kayak&containerTag=api_forget");
+  assert.ok(
+    hybrid.body.results.some((r) => r.source === "document" && /kayak/i.test(r.text)),
+    "the retained source note should remain inspectable"
+  );
+});
+
 test("search supports all three modes", async () => {
   await postAdd("I am a backend engineer who uses Neovim.", "api_d");
   for (const mode of ["hybrid", "memories", "documents"]) {
