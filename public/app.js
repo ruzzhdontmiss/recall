@@ -261,15 +261,15 @@ async function runSearch() {
       `/v1/search${containerParam({ q, searchMode: searchMode.value })}`
     );
     // Be honest about how the results were ranked: never present a lexical
-    // fallback as semantic search.
+    // fallback as semantic search. "hybrid" is the normal dense+lexical path.
     const note =
-      ranking === "dense"
-        ? ""
-        : `<li class="empty-hint">ranked lexically${
+      ranking === "lexical"
+        ? `<li class="empty-hint">ranked lexically${
             embeddingsProvider === "uninitialized"
               ? " — the embedding provider is unavailable"
               : ""
-          }; matching is keyword-based, not semantic</li>`;
+          }; matching is keyword-based, not semantic</li>`
+        : "";
     if (!results.length) {
       searchResults.innerHTML =
         note + `<li class="empty-hint">no matches — try different wording, or add more memories first</li>`;

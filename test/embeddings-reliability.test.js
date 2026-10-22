@@ -221,9 +221,11 @@ test("a row that cannot be placed in the current space sends the WHOLE set to le
   }
 });
 
-test("a fully current-space corpus still ranks densely", async () => {
+test("a fully current-space corpus still uses the dense path", async () => {
   const tag = "rel-dense";
-  const doc = seedDoc(tag, "alpha beta gamma");
+  // Single-token text keeps the lexical component at 1.0 as well, so the
+  // assertion isolates the dense path rather than the length dilution of TF-IDF.
+  const doc = seedDoc(tag, "alpha");
   const restore = patchEmbeddings({
     getImpl: async () => ({ kind: "xenova" }),
     isDense: () => true,
@@ -233,8 +235,8 @@ test("a fully current-space corpus still ranks densely", async () => {
     const state = search.createRankingState();
     const hits = await search.searchDocuments("alpha", [doc], state);
     assert.equal(hits.length, 1);
-    assert.ok(hits[0].score > 0.99, "identical vectors must score ~1");
-    assert.equal(search.rankingMode(state), "dense");
+    assert.ok(hits[0].score > 0.99, `identical vectors must score ~1 (got ${hits[0].score})`);
+    assert.equal(search.rankingMode(state), "hybrid");
   } finally {
     restore();
   }

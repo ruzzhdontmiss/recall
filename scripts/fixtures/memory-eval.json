@@ -529,6 +529,228 @@
       "mode": "memories",
       "category": "noanswer",
       "noAnswer": true
+    },
+    {
+      "id": "heldout_work",
+      "q": "Who is the user's employer?",
+      "mode": "memories",
+      "category": "heldout",
+      "expect": [
+        "Globex"
+      ],
+      "forbid": [
+        "Acme Corp"
+      ]
+    },
+    {
+      "id": "heldout_location",
+      "q": "What city is the user located in?",
+      "mode": "memories",
+      "category": "heldout",
+      "expect": [
+        "Lisbon"
+      ],
+      "forbid": [
+        "Berlin"
+      ]
+    },
+    {
+      "id": "heldout_role",
+      "q": "What position does the user hold?",
+      "mode": "memories",
+      "category": "heldout",
+      "expect": [
+        "staff engineer"
+      ],
+      "forbid": [
+        "backend engineer"
+      ]
+    },
+    {
+      "id": "heldout_editor",
+      "q": "Which IDE does the user use?",
+      "mode": "memories",
+      "category": "heldout",
+      "expect": [
+        "Neovim"
+      ]
+    },
+    {
+      "id": "heldout_language",
+      "q": "What is the user's preferred programming language?",
+      "mode": "memories",
+      "category": "heldout",
+      "expect": [
+        "Python"
+      ],
+      "forbid": [
+        "Rust"
+      ]
+    },
+    {
+      "id": "heldout_atlas_store",
+      "q": "What datastore does Project Atlas use?",
+      "mode": "memories",
+      "category": "heldout",
+      "expect": [
+        "Atlas",
+        "PostgreSQL"
+      ]
+    },
+    {
+      "id": "heldout_billing",
+      "q": "What is the user currently working on?",
+      "mode": "memories",
+      "category": "heldout",
+      "expect": [
+        "billing migration"
+      ]
+    },
+    {
+      "id": "heldout_db",
+      "q": "Which database does the user prefer?",
+      "mode": "memories",
+      "category": "heldout",
+      "expect": [
+        "SQLite"
+      ],
+      "forbid": [
+        "My favorite database is PostgreSQL"
+      ]
+    },
+    {
+      "id": "heldout_doc_az",
+      "q": "How many availability zones does the production cluster use?",
+      "mode": "documents",
+      "category": "heldout",
+      "expect": [
+        "three availability zones"
+      ]
+    },
+    {
+      "id": "heldout_doc_postmortem",
+      "q": "How soon is a postmortem due after an incident?",
+      "mode": "documents",
+      "category": "heldout",
+      "expect": [
+        "five business days"
+      ]
+    },
+    {
+      "id": "heldout_doc_bucket",
+      "q": "Where are backups archived?",
+      "mode": "documents",
+      "category": "heldout",
+      "expect": [
+        "recall-archive-2026"
+      ]
+    },
+    {
+      "id": "heldout_doc_sev1",
+      "q": "What paging service is used for sev1 incidents?",
+      "mode": "documents",
+      "category": "heldout",
+      "expect": [
+        "Opsgenie"
+      ]
+    },
+    {
+      "id": "none_age",
+      "q": "How old is the user?",
+      "mode": "memories",
+      "category": "noanswer",
+      "noAnswer": true
+    },
+    {
+      "id": "none_salary",
+      "q": "What is the user's current salary?",
+      "mode": "memories",
+      "category": "noanswer",
+      "noAnswer": true
+    },
+    {
+      "id": "none_pet",
+      "q": "What is the user's dog called?",
+      "mode": "memories",
+      "category": "noanswer",
+      "noAnswer": true
+    },
+    {
+      "id": "none_globex_size",
+      "q": "How many employees work at Globex?",
+      "mode": "memories",
+      "category": "noanswer",
+      "noAnswer": true
+    },
+    {
+      "id": "none_globex_hq",
+      "q": "Where is Globex headquartered?",
+      "mode": "memories",
+      "category": "noanswer",
+      "noAnswer": true
+    },
+    {
+      "id": "none_atlas_lang",
+      "q": "Which programming language is Project Atlas written in?",
+      "mode": "memories",
+      "category": "noanswer",
+      "noAnswer": true
+    },
+    {
+      "id": "none_staging_owner",
+      "q": "Which team owns the staging cluster?",
+      "mode": "documents",
+      "category": "noanswer",
+      "noAnswer": true
+    },
+    {
+      "id": "none_log_retention",
+      "q": "How long are production logs retained?",
+      "mode": "documents",
+      "category": "noanswer",
+      "noAnswer": true
+    },
+    {
+      "id": "none_oncall_name",
+      "q": "Who is the current on-call engineer?",
+      "mode": "documents",
+      "category": "noanswer",
+      "noAnswer": true
+    },
+    {
+      "id": "none_python_version",
+      "q": "Which version of Python does the user use?",
+      "mode": "memories",
+      "category": "noanswer",
+      "noAnswer": true
+    },
+    {
+      "id": "none_orion_db",
+      "q": "What database does Project Orion use?",
+      "mode": "memories",
+      "category": "noanswer",
+      "noAnswer": true
+    },
+    {
+      "id": "none_rollback_time",
+      "q": "How long does a rollback take?",
+      "mode": "documents",
+      "category": "noanswer",
+      "noAnswer": true
+    },
+    {
+      "id": "none_berlin_weather",
+      "q": "What is the weather in Berlin?",
+      "mode": "memories",
+      "category": "noanswer",
+      "noAnswer": true
+    },
+    {
+      "id": "none_favorite_food",
+      "q": "What is the user's favorite food?",
+      "mode": "memories",
+      "category": "noanswer",
+      "noAnswer": true
     }
   ],
   "deletion": {

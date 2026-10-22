@@ -99,7 +99,8 @@ searchable at passage granularity:
    deadline (the thread is terminated when it expires), the number of concurrent parsers and
    the queue behind them are bounded, and a parser crash or timeout fails only that upload.
 4. **Chunk** — text is split into overlapping passages (paragraph/sentence-aware) with character
-   offsets and, for PDFs, the page number.
+   offsets and, for PDFs, the page number. Overlap starts snap to a sentence or line boundary
+   (bounded), so a retrieved passage does not begin in the middle of a word.
 5. **Embed** — chunks are embedded in batches when a dense provider is configured; embedding is
    best-effort and a failure leaves the chunk lexically searchable rather than lost.
 6. **Persist** — the document row and its chunks are written in one transaction after the file
@@ -329,10 +330,18 @@ curl -X POST localhost:6767/v1/add -H "Authorization: Bearer $KEY" -H "Content-T
   -d '{"content":"I am a backend engineer. I live in Berlin. I prefer Rust over Go.","containerTag":"user_123"}'
 
 # Hybrid search (memories + documents). searchMode: hybrid | memories | documents
-# -> { results, searchMode, containerTag, embeddingsProvider, ranking }
-#    `ranking` is "dense" | "lexical" | "none" — it reports how THIS response was
-#    actually ranked, so a lexical fallback is never reported as semantic search.
+# -> { results, searchMode, containerTag, embeddingsProvider, ranking, minScore }
+#    `ranking` is "hybrid" | "dense" | "lexical" | "none" — it reports how THIS
+#    response was actually ranked, so a lexical fallback is never reported as
+#    semantic search. "hybrid" means dense vectors were reranked with lexical
+#    evidence and (for memories) extracted-slot intent.
+#    `minScore` is an opt-in relevance floor (0..1, default 0); it filters the
+#    reported scores and is not a calibrated probability. See the no-answer
+#    discussion under Embeddings before choosing a value.
 curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/search?q=where+does+the+user+live&containerTag=user_123&searchMode=hybrid"
+
+# Same query with an explicit floor (returns only hits whose reported score is >= 0.5)
+curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/search?q=where+does+the+user+live&containerTag=user_123&minScore=0.5"
 
 # User profile: static (durable) + dynamic (temporary) facts
 curl -H "Authorization: Bearer $KEY" "localhost:6767/v1/profile?containerTag=user_123"
@@ -576,10 +585,33 @@ ranked lexically (TF-IDF), so content is never silently dropped and two spaces a
 one response. A failed reindex never records the space, so the next startup keeps warning until it
 is complete.
 
-Every search response carries an authoritative `ranking` field (`dense` | `lexical` | `none`)
-describing how *that* response was actually ranked, so a degraded/lexical result can never be
-mistaken for semantic search; `embeddingsProvider` separately names the loaded provider. A provider
-that cannot load degrades search to lexical with HTTP `200` (it does not fail the request).
+Every search response carries an authoritative `ranking` field (`hybrid` | `dense` | `lexical` |
+`none`) describing how *that* response was actually ranked, so a degraded/lexical result can never
+be mistaken for semantic search; `embeddingsProvider` separately names the loaded provider. A
+provider that cannot load degrades search to lexical with HTTP `200` (it does not fail the
+request).
+
+**Hybrid reranking.** With a dense provider, the final order is a weighted combination of the
+cosine score (80%) and lexical TF-IDF overlap (20%) over the same candidate set, plus a `+0.05`
+prior for a memory whose extracted slot matches the question's intent. The lexical component is
+what fixes short questions such as "Where does the user work?" when the embedding model ranks a
+nearby fact slightly higher; the slot prior handles explicit questions such as "Where is the user
+based?" even when the wording shares no token with the stored fact. It is local and offline, adds
+no provider dependency, and never widens the candidate set: dense recall still decides what can be
+returned. `ranking` reports `"hybrid"` for this path; the lexical fallback keeps its pure TF-IDF
+behavior and reports `"lexical"`. Scores are relative relevance values, not probabilities; the
+slot prior can push an already-near-perfect match slightly above `1.0`.
+
+**No-answer behavior is opt-in.** Search does not suppress results by default, because absolute
+scores are not calibrated probabilities. `minScore` (0..1, default `0`) filters on the reported
+score; it is backward compatible. On the 70-question evaluation (50 answerable, 20 no-answer),
+a floor of `0.40` keeps all 49 correct top-1 answers but still returns a hit for 14/20 no-answer
+probes; a floor of `0.60` rejects 17/20 probes but also suppresses 27/49 correct answers. A
+near-miss entity question ("How many employees work at Globex?") scores about `0.76` while some
+correct answers are below `0.50`, so no single global cutoff separates them. Choose a floor only
+as an explicit product policy, and prefer combining it with an answerability check or a UI
+"low confidence" state. Run `npm run eval:memory -- --abstention` to reproduce the trade-off
+curve.
 
 **Hosted providers** (`openai`, `gemini`) record the configured model id only. If a provider
 changes its server-side model behaviour without changing the id, Recall cannot detect it and the
@@ -623,13 +655,15 @@ npm test                      # storage, migration, API, auth/isolation, documen
 npm run eval:search           # paraphrase retrieval check (downloads the local model on first run)
 npm run eval:extract          # regex-gap + structured-schema check (live LLM skipped without a key)
 npm run eval:documents        # end-to-end txt/md/pdf ingestion, attribution, dedupe, scoping, delete
-npm run eval:memory           # 44-question retrieval set: top-1, Recall@5, stale/conflict, provenance
+npm run eval:memory           # 70-question retrieval set: top-1, Recall@5, stale/conflict, provenance
 ```
 
 `eval:memory` ingests synthetic facts and a multi-chunk document through the real HTTP API,
 then measures retrieval. `--strict` enforces the fixture thresholds and fails on stale hits
 (CI runs it this way). It also probes questions with no answer, reports the response's real
 `ranking` mode, and verifies that deleting a document removes its chunks and stored file.
+`--abstention` prints the `minScore` false-positive/false-negative trade-off curve;
+`--diagnose` prints the top five candidates and a lexical comparison for every miss.
 
 Tests use Node's built-in runner with temporary directories and never touch the real store.
 They run with `EMBEDDINGS_PROVIDER=tfidf` and `EXTRACTION_PROVIDER=regex` for speed and
@@ -648,7 +682,7 @@ RECALL_URL=http://127.0.0.1:6767 RECALL_KEY=sm_… npm run smoke
 ```
 
 It checks liveness/readiness, authentication, ingest → search → profile, a file upload with
-attribution and dedupe, deletion, and that a lexical provider is never reported as dense. It
+attribution and dedupe, deletion, and that a lexical provider is never reported as semantic/hybrid. It
 cleans up everything it creates and exits non-zero on the first failure.
 
 To exercise the supported configurations end to end (and prove the default bind is not
@@ -676,7 +710,7 @@ SMOKE_SKIP_DENSE=1 npm run smoke:matrix   # skip the scenarios that load the loc
   every start.
 - **Cross-platform.** Verified on macOS (darwin-arm64) and in the Linux image on both
   `linux/amd64` and `linux/arm64` (Node 22): build from the committed lockfile, the full suite,
-  native ONNX inference returning `ranking: "dense"` (the `onnxruntime-node` shared library is
+  native ONNX inference returning `ranking: "hybrid"` (the `onnxruntime-node` shared library is
   confirmed mapped in the process), database/uploads persistence across a restart, graceful
   `SIGTERM` (exit 0), non-root execution, and loopback-only publishing. The `container` CI job
   repeats the build and runtime checks on `ubuntu-latest`.
@@ -818,13 +852,19 @@ Recall is a single-node, self-hosted engine. Known limits, stated honestly:
 - **Rate limiting is in-memory and per-process**, not distributed.
 - **Brute-force vector scoring.** Search ranks vectors in memory rather than using an indexed
   vector store; fine for this scale, not for millions of rows.
-- **Retrieval quality is model-bound.** On the deterministic 44-question evaluation (38
-  answerable; `npm run eval:memory`), the local `bge-base-en-v1.5` provider scores **84.2% top-1** and
-  **94.7% Recall@5**; the lexical fallback scores **73.7% / 81.6%**. Some paraphrases (for
-  example "Where is the user based?" for a stored "I now live in Lisbon.") rank outside the
-  top 5. Search returns scored candidates and does **not** apply a relevance cutoff, so a
-  client that needs "no answer" behavior should threshold on `score`. Closing these misses
-  needs a stronger reranker or hybrid scoring, not a formatting change.
+- **Retrieval quality is model-bound.** On the deterministic 70-question evaluation (50
+  answerable, 20 no-answer; `npm run eval:memory`), the local `bge-base-en-v1.5` provider with
+  hybrid reranking scores **98.0% top-1** (49/50) and **98.0% Recall@5** (49/50); the pure lexical
+  fallback scores **70.0% / 78.0%**. The one remaining miss is a transposed typo
+  (`"Where does the user wrok?"`), which both the embedding model and TF-IDF fail to map to the
+  employer fact. A typo-tolerant query normalizer is the next experiment for that case; a stronger
+  reranker remains the next experiment for questions whose wording shares no term with the stored
+  fact. The on-call document question ranks its answer first with a healthy margin after overlap
+  starts were snapped to sentence boundaries. Search returns scored candidates and does
+  **not** apply a relevance cutoff by default, because scores are not calibrated: 12/20 no-answer
+  probes score at or above the lowest correct top-1, including a near-miss entity question at
+  ~0.76. `minScore` is available for an explicit client policy, but no single global cutoff is
+  safe (see the trade-off curve printed by `--abstention`).
 - **Contradiction resolution is slot-based.** Location, employer, role, editor, language
   preference and "my favorite &lt;thing&gt;" are superseded when a newer value arrives; the old
   row is retained with status `superseded` (visible in `/v1/memories`) but excluded from search
@@ -876,7 +916,7 @@ operationally ready for a **private, single-instance** deployment: liveness/read
 endpoints, draining-aware graceful shutdown, fail-fast configuration validation, a minimal
 non-root container, a smoke matrix and CI. Realistic memory workflows (updates, conflicts,
 document provenance, deletion, restart persistence, provider failure) and a deterministic
-44-question retrieval evaluation are part of the suite. Search reports how it actually ranked
-(`ranking`: `dense` | `lexical` | `none`) so a degraded fallback is never presented as semantic
+70-question retrieval evaluation are part of the suite. Search reports how it actually ranked
+(`ranking`: `hybrid` | `dense` | `lexical` | `none`) so a degraded fallback is never presented as semantic
 search. It is a focused engineering project, **not** a production-hardened, horizontally-scaled
 service — see [Limitations](#limitations) before exposing it.
